@@ -1,0 +1,21 @@
+[package]
+name = "transcriber-cli"
+version = "0.1.0"
+edition = "2021"
+authors = ["Dobri"]
+description = "High-performance CLI audio transcriber using NVIDIA Parakeet TDT 0.6B v3"
+
+[[bin]]
+name = "transcriber"
+path = "main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
+indicatif = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.14"
+anyhow = "1.0"
+hound = "3.5"
+parakeet-rs = "0.4.1"
