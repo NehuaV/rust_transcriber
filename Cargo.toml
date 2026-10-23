@@ -7,7 +7,7 @@ description = "High-performance CLI audio transcriber using NVIDIA Parakeet TDT 
 
 [[bin]]
 name = "transcriber"
-path = "main.rs"
+path = "rust/src/main.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
@@ -17,5 +17,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tempfile = "3.14"
 anyhow = "1.0"
-hound = "3.5"
 parakeet-rs = "0.4.1"
+ffmpeg-next = "9.0"
+
+[dependencies.ffmpeg-sys-next]
+version = "9.0"
+features = ["static"]
