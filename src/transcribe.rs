@@ -1,29 +1,21 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use colored::*;
 use ffmpeg_next as ffmpeg;
 use indicatif::{ProgressBar, ProgressStyle};
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
-use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// ============================================================================
-// EMBEDDED MODEL ASSETS (Baked directly into the compiled Rust binary)
-// Zero reliance on external network downloads or system paths!
-// ============================================================================
-const VOCAB_BYTES: &[u8] = include_bytes!("../../models/vocab.txt");
-const DECODER_BYTES: &[u8] = include_bytes!("../../models/decoder_joint-model.int8.onnx");
-const ENCODER_BYTES: &[u8] = include_bytes!("../../models/encoder-model.int8.onnx");
+// Model directory resolution for local models/basic.
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "transcriber",
+    name = "transcribe",
     author = "Dobri",
     version = "0.1.0",
-    about = "⚡ Completely self-contained speech-to-text CLI powered by embedded NVIDIA Parakeet TDT 0.6B v3 and statically linked FFmpeg",
-    long_about = "Transcribe any audio or video format (M4A, MP3, WAV, FLAC, OGG, OPUS, AAC, WEBM, MP4, etc.) using embedded NVIDIA Parakeet TDT weights and statically linked FFmpeg audio decoding."
+    about = "Audio transcription CLI powered by NVIDIA Parakeet TDT 0.6B and static FFmpeg",
+    long_about = "Transcribe audio and video containers (M4A, MP3, WAV, FLAC, OGG, OPUS, AAC, WEBM, MP4, etc.) using local NVIDIA Parakeet TDT weights and statically linked FFmpeg decoding."
 )]
 struct Cli {
     /// Path to the audio or video file to transcribe
@@ -34,62 +26,65 @@ struct Cli {
     #[arg(short, long, value_name = "OUTPUT_FILE")]
     output: Option<PathBuf>,
 
-    /// Output full transcription result as JSON
-    #[arg(long)]
-    json: bool,
-
-    /// Only output the transcribed text, suppressing banners and metrics
+    /// Only output the transcribed text, suppressing metrics and status messages
     #[arg(short, long)]
     quiet: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct TranscriptionJson {
-    text: String,
-    duration: f64,
-    processing_time: f64,
-    rtfx: f64,
-    model: String,
-    word_count: usize,
-    char_count: usize,
-}
-
-/// Unpacks embedded model files to cache directory if not already present.
-fn ensure_embedded_model() -> Result<PathBuf> {
-    let target_dir = if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".cache/parakeet-rs/embedded-tdt-0.6b-v3")
-    } else {
-        std::env::temp_dir().join("parakeet-rs-embedded-tdt-0.6b-v3")
-    };
-
-    fs::create_dir_all(&target_dir).context("Failed to create embedded model directory")?;
-
-    let vocab_path = target_dir.join("vocab.txt");
-    let decoder_path = target_dir.join("decoder_joint-model.int8.onnx");
-    let encoder_path = target_dir.join("encoder-model.int8.onnx");
-
-    if !vocab_path.exists()
-        || fs::metadata(&vocab_path).map(|m| m.len()).unwrap_or(0) != VOCAB_BYTES.len() as u64
-    {
-        fs::write(&vocab_path, VOCAB_BYTES)
-            .context("Failed to write embedded vocabulary to cache")?;
+/// Resolves the model directory for Parakeet TDT from `models/basic`.
+/// Uses local disk weights without looking at .cache or making network requests.
+fn resolve_model_dir() -> Result<PathBuf> {
+    // 1. Check environment variable override
+    if let Ok(dir_str) = std::env::var("PARAKEET_MODEL_DIR").or_else(|_| std::env::var("MODELS_DIR")) {
+        let p = PathBuf::from(dir_str);
+        let candidate = if p.join("vocab.txt").exists() { p } else { p.join("basic") };
+        if candidate.join("vocab.txt").exists() {
+            return Ok(candidate);
+        }
     }
 
-    if !decoder_path.exists()
-        || fs::metadata(&decoder_path).map(|m| m.len()).unwrap_or(0) != DECODER_BYTES.len() as u64
-    {
-        fs::write(&decoder_path, DECODER_BYTES)
-            .context("Failed to write embedded decoder ONNX model to cache")?;
+    // 2. Check relative to current working directory
+    let cwd_candidate = PathBuf::from("models/basic");
+    if cwd_candidate.join("vocab.txt").exists() {
+        return Ok(cwd_candidate);
     }
 
-    if !encoder_path.exists()
-        || fs::metadata(&encoder_path).map(|m| m.len()).unwrap_or(0) != ENCODER_BYTES.len() as u64
-    {
-        fs::write(&encoder_path, ENCODER_BYTES)
-            .context("Failed to write embedded encoder ONNX model to cache")?;
+    // 3. Check relative to executable location (resolving symlinks)
+    if let Ok(exe_path) = std::env::current_exe() {
+        let real_exe = fs::canonicalize(&exe_path).unwrap_or(exe_path);
+        if let Some(exe_dir) = real_exe.parent() {
+            let candidates = [
+                exe_dir.join("models/basic"),
+                exe_dir.join("../models/basic"),
+                exe_dir.join("../share/transcriber/models/basic"),
+            ];
+            for candidate in &candidates {
+                if candidate.join("vocab.txt").exists() {
+                    return Ok(candidate.clone());
+                }
+            }
+        }
     }
 
-    Ok(target_dir)
+    // 4. Check user local share directory (~/.local/share/transcriber/models/basic)
+    if let Ok(home) = std::env::var("HOME") {
+        let share_dir = PathBuf::from(home).join(".local/share/transcriber/models/basic");
+        if share_dir.join("vocab.txt").exists() {
+            return Ok(share_dir);
+        }
+    }
+
+    // 5. Compile-time directory fallback
+    let manifest_rel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/basic");
+    if manifest_rel.join("vocab.txt").exists() {
+        return Ok(manifest_rel);
+    }
+
+    bail!(
+        "Parakeet TDT model not found in 'models/basic'.\n\
+         Please run scripts/build.rs or execute:\n\
+         cargo run --bin download-models"
+    )
 }
 
 struct DecodedAudio {
@@ -101,7 +96,6 @@ struct DecodedAudio {
 
 /// Decodes any audio or video container (M4A, MP3, WAV, FLAC, OGG, OPUS, AAC, MP4, etc.)
 /// into a 16kHz mono PCM buffer using natively statically linked FFmpeg C libraries (ffmpeg-next).
-/// Zero external dynamic libraries or spawned commands required!
 fn decode_audio<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
     let path = path.as_ref();
     let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
@@ -248,16 +242,16 @@ fn main() -> Result<()> {
         .to_string();
 
     // Spinner for feedback
-    let spinner = if !cli.quiet && !cli.json {
+    let spinner = if !cli.quiet {
         let sp = ProgressBar::new_spinner();
         sp.set_style(
             ProgressStyle::default_spinner()
-                .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-                .template("{spinner:.green} {msg}")
+                .tick_chars("-\\|/")
+                .template("{spinner} {msg}")
                 .unwrap(),
         );
         sp.enable_steady_tick(Duration::from_millis(80));
-        sp.set_message("Decoding audio (statically linked FFmpeg engine)...");
+        sp.set_message("Decoding audio...");
         Some(sp)
     } else {
         None
@@ -268,12 +262,12 @@ fn main() -> Result<()> {
         .context("Failed to decode audio. Please ensure the file contains a valid audio stream.")?;
 
     if let Some(ref sp) = spinner {
-        sp.set_message("Loading embedded NVIDIA Parakeet TDT model...");
+        sp.set_message("Loading Parakeet TDT model...");
     }
 
-    // Step 2: Ensure embedded model is ready
-    let model_dir = ensure_embedded_model()
-        .context("Failed to prepare embedded Parakeet TDT model")?;
+    // Step 2: Locate local model in models/basic
+    let model_dir =
+        resolve_model_dir().context("Failed to locate Parakeet TDT model in 'models/basic'")?;
 
     // Step 3: Run inference via parakeet-rs
     let t0 = Instant::now();
@@ -282,10 +276,10 @@ fn main() -> Result<()> {
         .context("Failed to initialize ONNX Runtime environment")?;
     let config = ExecutionConfig::new().with_environment(env);
     let mut model = ParakeetTDT::from_pretrained(&model_dir, Some(config))
-        .context("Failed to load ParakeetTDT model from embedded assets")?;
+        .context("Failed to load ParakeetTDT model from 'models/basic'")?;
 
     if let Some(ref sp) = spinner {
-        sp.set_message("Transcribing with embedded Parakeet TDT...");
+        sp.set_message("Transcribing...");
     }
 
     let result = model
@@ -309,79 +303,37 @@ fn main() -> Result<()> {
     } else {
         text.split_whitespace().count()
     };
-    let char_count = text.len();
 
     // Output formatting
-    if cli.json {
-        let json_data = TranscriptionJson {
-            text: text.clone(),
-            duration: (audio.duration_secs * 100.0).round() / 100.0,
-            processing_time: (elapsed * 1000.0).round() / 1000.0,
-            rtfx,
-            model: "nvidia/parakeet-tdt-0.6b-v3 [embedded]".to_string(),
-            word_count,
-            char_count,
-        };
-        println!("{}", serde_json::to_string_pretty(&json_data)?);
-    } else if cli.quiet {
+    if cli.quiet {
         println!("{}", text);
     } else {
+        println!(
+            "Input: {} (duration: {}, codec: {}, size: {})",
+            input_filename,
+            format_duration(audio.duration_secs),
+            audio.codec_name,
+            format_bytes(audio.size_bytes)
+        );
+        println!(
+            "Speed: {:.1}x real-time ({:.2}s elapsed, {} words)",
+            rtfx, elapsed, word_count
+        );
         println!();
-        println!(
-            "{} {}",
-            "🦜 PARAKEET TRANSCRIBER".bold().green(),
-            "[Embedded Model • Statically Linked FFmpeg • Zero System Dependencies]".dimmed()
-        );
-        println!(
-            "🎵 Input: {} ({}, {}, {})",
-            input_filename.bold().white(),
-            format_duration(audio.duration_secs).cyan(),
-            audio.codec_name.yellow(),
-            format_bytes(audio.size_bytes).dimmed()
-        );
-        println!(
-            "⚡ Engine: {} | Speed: {} (in {:.2}s) | Words: {}",
-            "parakeet-rs".magenta().bold(),
-            format!("{:.1}x real-time", rtfx).bold().green(),
-            elapsed,
-            word_count.to_string().yellow()
-        );
-        println!("\n{}", "─".repeat(60).dimmed());
-        println!("{}", "TRANSCRIPTION:".bold().white());
-        println!("{}", "─".repeat(60).dimmed());
         if text.is_empty() {
-            println!("{}", "(No speech detected)".dimmed().italic());
+            println!("(No speech detected)");
         } else {
             println!("{}", text);
         }
-        println!("{}\n", "─".repeat(60).dimmed());
     }
 
     // Save to output file if requested
     if let Some(ref out_path) = cli.output {
-        if cli.json {
-            let json_data = TranscriptionJson {
-                text,
-                duration: (audio.duration_secs * 100.0).round() / 100.0,
-                processing_time: (elapsed * 1000.0).round() / 1000.0,
-                rtfx,
-                model: "nvidia/parakeet-tdt-0.6b-v3 [embedded]".to_string(),
-                word_count,
-                char_count,
-            };
-            fs::write(out_path, serde_json::to_string_pretty(&json_data)?)
-                .with_context(|| format!("Failed to write JSON output to {}", out_path.display()))?;
-        } else {
-            fs::write(out_path, &text)
-                .with_context(|| format!("Failed to write transcript to {}", out_path.display()))?;
-        }
+        fs::write(out_path, &text)
+            .with_context(|| format!("Failed to write transcript to {}", out_path.display()))?;
 
         if !cli.quiet {
-            println!(
-                "{} {}",
-                "💾 Saved transcript to:".bold().green(),
-                out_path.display().to_string().cyan().underline()
-            );
+            println!("\nSaved transcript to: {}", out_path.display());
         }
     }
 

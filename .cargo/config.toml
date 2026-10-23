@@ -1,2 +1,2 @@
 [target.aarch64-apple-darwin]
-rustflags = ["-L", "native=/opt/homebrew/lib"]
+rustflags = ["-L", "native=/opt/homebrew/lib", "-A", "linker_messages"]

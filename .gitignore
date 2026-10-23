@@ -14,5 +14,14 @@ wheels/
 # Rust build artifacts
 target/
 /transcriber
+/basic
+/streaming
+/transcribe
+/stranscribe
+models/
 output.txt
 output.json
+transcript.txt
+.vscode/
+
+
