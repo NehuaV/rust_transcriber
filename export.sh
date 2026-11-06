@@ -16,20 +16,18 @@ mkdir -p "$SHARE_DIR"
 # 3. Install the compiled binaries directly into TARGET_DIR
 echo "Installing binaries to $TARGET_DIR..."
 cp -f "$DIR/target/release/transcribe" "$TARGET_DIR/transcribe"
-cp -f "$DIR/target/release/stranscribe" "$TARGET_DIR/stranscribe"
-chmod +x "$TARGET_DIR/transcribe" "$TARGET_DIR/stranscribe"
+chmod +x "$TARGET_DIR/transcribe"
 
 # Sign binaries on macOS
 if command -v codesign >/dev/null 2>&1; then
     codesign -s - -f "$TARGET_DIR/transcribe" >/dev/null 2>&1 || true
-    codesign -s - -f "$TARGET_DIR/stranscribe" >/dev/null 2>&1 || true
 fi
 
 # 4. Link shared models to ~/.local/share/transcriber so binaries resolve them independently
 ln -sfn "$DIR/models" "$SHARE_DIR/models"
 
 # 5. Remove root copies from the repository so it remains clean
-rm -f "$DIR/transcribe" "$DIR/stranscribe"
+rm -f "$DIR/transcribe"
 
 # 6. Detect user shell configuration file
 DETECTED_SHELL="${SHELL##*/}"
@@ -51,9 +49,8 @@ esac
 
 echo ""
 echo "Installation complete."
-echo "Binaries installed in: $TARGET_DIR"
+echo "Binary installed in: $TARGET_DIR"
 echo "  - $TARGET_DIR/transcribe"
-echo "  - $TARGET_DIR/stranscribe"
 echo ""
 
 # Check if TARGET_DIR is in PATH

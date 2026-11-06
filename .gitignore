@@ -15,9 +15,7 @@ wheels/
 target/
 /transcriber
 /basic
-/streaming
 /transcribe
-/stranscribe
 models/
 output.txt
 output.json

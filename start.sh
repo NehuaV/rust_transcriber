@@ -2,19 +2,7 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-
-# Check if the user specified a binary mode explicitly
-if [ "$1" = "transcribe" ] || [ "$1" = "basic" ]; then
-    TARGET="transcribe"
-    shift
-elif [ "$1" = "stranscribe" ] || [ "$1" = "streaming" ]; then
-    TARGET="stranscribe"
-    shift
-else
-    # Default engine is stranscribe
-    TARGET="stranscribe"
-fi
-
+TARGET="transcribe"
 BIN="$DIR/$TARGET"
 
 if [ -f "$BIN" ]; then

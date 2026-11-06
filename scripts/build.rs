@@ -1,6 +1,6 @@
 //! Build script and standalone model downloader for Transcriber CLI.
 //!
-//! Checks if required ONNX models exist in `models/basic` and `models/streaming`.
+//! Checks if required ONNX models exist in `models/basic`.
 //! If they are already present and match exact sizes and standard library hashes, exits immediately.
 //! If missing or corrupted, downloads them directly from official Hugging Face repositories.
 
@@ -35,39 +35,6 @@ const BASIC_MODELS: &[ModelFile] = &[
         url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
         expected_size: 652_183_999,
         expected_hash: 0x5565_3a37_d4ab_d343,
-    },
-];
-
-const STREAMING_MODELS: &[ModelFile] = &[
-    ModelFile {
-        rel_path: "streaming/config.json",
-        url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/config.json",
-        expected_size: 2_970,
-        expected_hash: 0xd726_4578_f18a_f3b8,
-    },
-    ModelFile {
-        rel_path: "streaming/tokenizer.model",
-        url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/tokenizer.model",
-        expected_size: 406_554,
-        expected_hash: 0xb406_c155_b4e0_5d9d,
-    },
-    ModelFile {
-        rel_path: "streaming/decoder_joint.onnx",
-        url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/decoder_joint.onnx",
-        expected_size: 24_483_962,
-        expected_hash: 0x12b0_b8b3_63b0_8d5c,
-    },
-    ModelFile {
-        rel_path: "streaming/encoder.onnx",
-        url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/encoder.onnx",
-        expected_size: 42_963_073,
-        expected_hash: 0x9d53_86af_8885_9b04,
-    },
-    ModelFile {
-        rel_path: "streaming/encoder.onnx.data",
-        url: "https://huggingface.co/smcleod/nemotron-3.5-asr-streaming-0.6b-int8/resolve/main/encoder.onnx.data",
-        expected_size: 614_649_600,
-        expected_hash: 0x66c4_d97f_393a_046a,
     },
 ];
 
@@ -290,11 +257,6 @@ pub fn main() {
 
     if let Err(e) = check_and_download_group(&models_dir, BASIC_MODELS, "basic") {
         eprintln!("error: failed to prepare basic models: {}", e);
-        std::process::exit(1);
-    }
-
-    if let Err(e) = check_and_download_group(&models_dir, STREAMING_MODELS, "streaming") {
-        eprintln!("error: failed to prepare streaming models: {}", e);
         std::process::exit(1);
     }
 
