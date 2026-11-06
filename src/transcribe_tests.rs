@@ -126,6 +126,60 @@ fn join_words_attaches_punctuation() {
     assert_eq!(join_words(&words), "Hello, world.");
 }
 
+#[test]
+fn a_word_kept_by_two_windows_is_merged_once() {
+    let merged = merge_windows(vec![
+        vec![token("count", 10.0, 10.3), token("The", 12.8, 13.0)],
+        vec![token("The", 12.9, 13.1), token("counties", 13.2, 13.7)],
+    ]);
+    let text: Vec<&str> = merged.iter().map(|w| w.text.as_str()).collect();
+    assert_eq!(text, vec!["count", "The", "counties"]);
+}
+
+#[test]
+fn a_real_repetition_across_a_seam_is_kept() {
+    // "the the": the second one is spoken 0.4 s later.
+    let merged = merge_windows(vec![
+        vec![token("the", 12.5, 12.7)],
+        vec![token("the", 12.9, 13.1), token("voice", 13.2, 13.5)],
+    ]);
+    assert_eq!(merged.len(), 3);
+}
+
+#[test]
+fn repetition_inside_one_window_is_never_merged() {
+    let merged = merge_windows(vec![vec![token("I", 1.0, 1.1), token("I", 1.1, 1.2)]]);
+    assert_eq!(merged.len(), 2);
+}
+
+#[test]
+fn same_word_ignores_case_and_punctuation() {
+    assert!(same_word("river.", "River"));
+    assert!(!same_word("river", "rivers"));
+    assert!(!same_word(".", ","));
+}
+
+#[test]
+fn variants_start_with_the_plain_decode_and_are_distinct() {
+    assert_eq!(VARIANTS[0], (0, coreml::LengthPolicy::ACTUAL));
+    for (i, a) in VARIANTS.iter().enumerate() {
+        assert!(!VARIANTS[i + 1..].contains(a), "duplicate variant {a:?}");
+    }
+    assert!(DEFAULT_VARIANTS as usize <= VARIANTS.len());
+    // The cut shifts never exceed the overlap's context on either side.
+    for (shift, _) in VARIANTS {
+        assert!(shift.abs() <= 3);
+    }
+}
+
+#[test]
+fn window_threads_are_bounded() {
+    assert_eq!(window_threads(1), 1);
+    assert!(window_threads(100) >= 1);
+    assert!(window_threads(100) <= MAX_WINDOW_THREADS);
+    assert_eq!(window_threads(0), 1);
+}
+
 fn token(text: &str, start: f32, end: f32) -> TimedToken {
     TimedToken {
         text: text.to_string(),

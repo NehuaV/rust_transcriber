@@ -1,5 +1,4 @@
 use crate::coreml::{encoder_frames, parse_vocab, tokens_to_words, FRAME_SECS};
-use crate::has_speech_gap;
 
 fn vocab(pieces: &[&str]) -> Vec<String> {
     pieces.iter().map(|s| s.to_string()).collect()
@@ -62,58 +61,6 @@ fn bare_space_piece_ends_the_current_word() {
     let words = tokens_to_words(&[(1, 0, 1), (0, 1, 1), (2, 2, 1)], &v);
     let text: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
     assert_eq!(text, vec!["ab", "cd"]);
-}
-
-fn tone(seconds: f32, amplitude: f32) -> Vec<f32> {
-    let n = (seconds * 16_000.0) as usize;
-    (0..n)
-        .map(|i| amplitude * (i as f32 * 0.05).sin())
-        .collect()
-}
-
-#[test]
-fn speech_with_no_words_is_a_gap() {
-    let window = tone(10.0, 0.1);
-    assert!(has_speech_gap(&window, 0.0, 10.0, &[]));
-}
-
-#[test]
-fn speech_with_words_throughout_is_not_a_gap() {
-    let window = tone(10.0, 0.1);
-    let words: Vec<f32> = (0..20).map(|i| i as f32 * 0.5 + 0.25).collect();
-    assert!(!has_speech_gap(&window, 0.0, 10.0, &words));
-}
-
-#[test]
-fn silence_with_no_words_is_not_a_gap() {
-    let window = vec![0.0f32; 160_000];
-    assert!(!has_speech_gap(&window, 0.0, 10.0, &[]));
-}
-
-#[test]
-fn a_long_skipped_stretch_inside_speech_is_a_gap() {
-    let window = tone(15.0, 0.1);
-    // Words at the start and end, nothing between 3 s and 9 s.
-    let mut words: Vec<f32> = (0..6).map(|i| i as f32 * 0.5 + 0.25).collect();
-    words.extend((18..30).map(|i| i as f32 * 0.5 + 0.25));
-    assert!(has_speech_gap(&window, 0.0, 15.0, &words));
-}
-
-#[test]
-fn a_short_pause_is_not_a_gap() {
-    let window = tone(10.0, 0.1);
-    // Nothing between 4 s and 5 s: only 1 s.
-    let mut words: Vec<f32> = (0..8).map(|i| i as f32 * 0.5 + 0.25).collect();
-    words.extend((10..20).map(|i| i as f32 * 0.5 + 0.25));
-    assert!(!has_speech_gap(&window, 0.0, 10.0, &words));
-}
-
-#[test]
-fn only_the_kept_range_is_checked() {
-    let window = tone(15.0, 0.1);
-    // Words only inside 6..10; the rest of the window is not ours to judge.
-    let words: Vec<f32> = (12..20).map(|i| i as f32 * 0.5 + 0.25).collect();
-    assert!(!has_speech_gap(&window, 6.0, 10.0, &words));
 }
 
 #[test]

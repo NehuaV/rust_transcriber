@@ -4,6 +4,9 @@ use ffmpeg_next as ffmpeg;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::thread;
 use std::time::{Duration, Instant};
 
 mod coreml;
@@ -30,6 +33,19 @@ struct Cli {
     /// Only output the transcribed text, suppressing metrics and status messages
     #[arg(short, long)]
     quiet: bool,
+
+    /// Ways each 15 second window is decoded; the fullest result is kept.
+    /// More variants recover more text from windows the model leaves blank,
+    /// at about 3.4 s per variant per 20 minutes of audio, but beyond 6 the
+    /// model can also produce invented phrases.
+    #[arg(
+        short,
+        long,
+        value_name = "N",
+        default_value_t = DEFAULT_VARIANTS,
+        value_parser = clap::value_parser!(u8).range(1..=12)
+    )]
+    variants: u8,
 }
 
 /// Finds a model directory `models/<sub>` that contains `marker`.
@@ -316,6 +332,44 @@ fn fold_trailing_punctuation(words: Vec<TimedToken>) -> Vec<TimedToken> {
     out
 }
 
+/// Two words are the same word when their letters and digits match.
+fn same_word(a: &str, b: &str) -> bool {
+    let key = |w: &str| -> String {
+        w.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let (a, b) = (key(a), key(b));
+    !a.is_empty() && a == b
+}
+
+/// Seconds within which a repeated word across a window seam is the same word.
+const SEAM_DUPLICATE_SECS: f32 = 0.25;
+
+/// Concatenate the words each window owns, in order. Neighbouring windows time
+/// the same word slightly differently, so a word at a seam can be kept by both.
+/// A word that repeats the previous window's last word at (almost) the same
+/// time is that duplicate and is dropped. A real repetition ("the the") is
+/// spoken later than that and is kept.
+fn merge_windows(windows: Vec<Vec<TimedToken>>) -> Vec<TimedToken> {
+    let mut merged: Vec<TimedToken> = Vec::new();
+    for window in windows {
+        let seam = merged.len();
+        for word in window {
+            let duplicate = merged.len() == seam
+                && merged.last().is_some_and(|prev| {
+                    same_word(&prev.text, &word.text)
+                        && (word.start - prev.start).abs() < SEAM_DUPLICATE_SECS
+                });
+            if !duplicate {
+                merged.push(word);
+            }
+        }
+    }
+    merged
+}
+
 /// Join words with single spaces, attaching trailing punctuation to the previous word.
 fn join_words(words: &[TimedToken]) -> String {
     let mut out = String::new();
@@ -361,239 +415,151 @@ const COREML_WINDOW_SAMPLES: usize = coreml::WINDOW_SAMPLES;
 /// the overlap, so every kept word had `overlap / 2` of context on both sides.
 const COREML_OVERLAP_SAMPLES: usize = 4 * SAMPLE_RATE as usize;
 
-/// Seconds per bin when looking for speech the model skipped.
-const GAP_BIN_SECS: f32 = 0.5;
-/// A stretch this long with speech-level energy and no words is suspicious.
-const GAP_SECS: f32 = 1.5;
-/// RMS above which a bin counts as speech-level (about -50 dBFS).
-const SPEECH_RMS: f32 = 0.003;
-/// Windows shorter than this are too small to call a blank suspicious.
-const MIN_RECOVERY_SECS: f32 = 2.0;
+/// Variants used unless `--variants` says otherwise.
+const DEFAULT_VARIANTS: u8 = 6;
 
-/// True when `window[keep_from..keep_to]` (seconds, relative to the window)
-/// holds a run of at least `GAP_SECS` of speech-level audio in which no word
-/// starts. `word_times` are word midpoints in the same time base.
-///
-/// The fixed-window CoreML export sometimes decodes a stretch of clear speech
-/// to nothing; that is the signature this looks for.
-fn has_speech_gap(window: &[f32], keep_from: f32, keep_to: f32, word_times: &[f32]) -> bool {
-    let rate = SAMPLE_RATE as f32;
-    let window_secs = window.len() as f32 / rate;
-    let from = keep_from.max(0.0);
-    let to = keep_to.min(window_secs);
-    if to - from < GAP_SECS {
-        return false;
-    }
+/// The ways a window is decoded: `(cut shift in seconds, length policy)`.
+const VARIANTS: [(i64, coreml::LengthPolicy); 12] = [
+    (0, coreml::LengthPolicy::ACTUAL),
+    (0, coreml::LengthPolicy::TRIMMED_TAIL),
+    (-1, coreml::LengthPolicy::ACTUAL),
+    (0, coreml::LengthPolicy::ENCODER_FULL_TRIMMED),
+    (1, coreml::LengthPolicy::ACTUAL),
+    (0, coreml::LengthPolicy::PREPROCESSOR_FULL_TRIMMED),
+    (-2, coreml::LengthPolicy::ACTUAL),
+    (2, coreml::LengthPolicy::ACTUAL),
+    (-1, coreml::LengthPolicy::TRIMMED_TAIL),
+    (1, coreml::LengthPolicy::TRIMMED_TAIL),
+    (-3, coreml::LengthPolicy::ACTUAL),
+    (3, coreml::LengthPolicy::ACTUAL),
+];
 
-    let mut run = 0.0f32;
-    let mut bin_start = from;
-    while bin_start < to {
-        let bin_end = (bin_start + GAP_BIN_SECS).min(to);
-        let lo = (bin_start * rate) as usize;
-        let hi = ((bin_end * rate) as usize).min(window.len());
-        let rms = if hi > lo {
-            (window[lo..hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo) as f32).sqrt()
-        } else {
-            0.0
-        };
-        let has_word = word_times.iter().any(|&t| t >= bin_start && t < bin_end);
-        if rms >= SPEECH_RMS && !has_word {
-            run += bin_end - bin_start;
-            if run >= GAP_SECS {
-                return true;
-            }
-        } else {
-            run = 0.0;
-        }
-        bin_start = bin_end;
-    }
-    false
-}
-
-/// Words one CoreML window owns, plus whether a suspicious gap remains.
-struct WindowWords {
-    words: Vec<TimedToken>,
-    gap: bool,
-}
-
-/// Keep the words a window owns and check them against the audio for gaps.
-fn own_window_words(
-    decode_words: Vec<TimedToken>,
-    window: &[f32],
-    offset_samples: usize,
-    start: usize,
-    end: usize,
-    index: usize,
-    total: usize,
-) -> WindowWords {
-    let words = own_words(
-        decode_words,
-        offset_samples,
-        start,
-        end,
-        COREML_OVERLAP_SAMPLES,
-        index,
-        total,
-    );
-
-    let rate = SAMPLE_RATE as f32;
-    let offset = start as f32 / rate;
-    let (keep_from, keep_to) = absolute_keep_window(
-        start,
-        end,
-        COREML_OVERLAP_SAMPLES,
-        index == 0,
-        index + 1 == total,
-    );
-    let mids: Vec<f32> = words
-        .iter()
-        .map(|w| (w.start + w.end) * 0.5 - offset)
-        .collect();
-    let gap = window.len() as f32 / rate >= MIN_RECOVERY_SECS
-        && has_speech_gap(window, keep_from - offset, keep_to - offset, &mids);
-    WindowWords { words, gap }
-}
-
-/// Retry cuts: seconds to shift the window start when a window still has a gap.
-/// A different cut flips an input on which the model would stay blank.
-const SHIFTS_SECS: [i64; 6] = [-1, 1, -2, 2, -3, 3];
-/// A retry must reach this mean token confidence to be trusted.
-const MIN_RECOVERY_CONFIDENCE: f32 = 0.7;
-/// A retry must emit at least this many tokens to be trusted.
-const MIN_RECOVERY_TOKENS: usize = 2;
-
-/// How many windows needed help.
-#[derive(Default)]
-struct RecoveryStats {
-    /// Windows that needed a retry and ended without a gap.
-    recovered: usize,
-    /// Windows that still have a gap after every retry.
-    unresolved: usize,
-}
-
-/// Decode `pcm[span_start..span_end]` and keep the words the nominal window
-/// `start..end` owns. Perturbed policies are only trusted when confident.
-#[allow(clippy::too_many_arguments)]
-fn try_decode(
-    engine: &coreml::CoreMlEngine,
-    pcm: &[f32],
-    span_start: usize,
-    span_end: usize,
-    policy: coreml::LengthPolicy,
-    start: usize,
-    end: usize,
-    index: usize,
-    total: usize,
-) -> Option<WindowWords> {
-    let decode = engine
-        .transcribe_window(&pcm[span_start..span_end], policy)
-        .ok()?;
-    if policy != coreml::LengthPolicy::ACTUAL
-        && (decode.token_count < MIN_RECOVERY_TOKENS
-            || decode.mean_confidence < MIN_RECOVERY_CONFIDENCE)
-    {
-        return None;
-    }
-    Some(own_window_words(
-        decode.words,
-        &pcm[start..end],
-        span_start,
-        start,
-        end,
-        index,
-        total,
-    ))
-}
-
-/// Decode one window. If the result leaves a stretch of speech-level audio
-/// without words, retry with perturbed length declarations, then with the cut
-/// shifted by a few seconds. Returns the first result without a gap, otherwise
-/// the attempt with the most words.
+/// Decode one window `variants` ways (the first entries of `VARIANTS`) and keep
+/// the result with the most words. Only the model's own outputs are compared;
+/// nothing about the audio is assumed, and no word is edited. A variant that
+/// blanks on this cut returns little or nothing, so it loses to one that does
+/// not.
 fn decode_window(
     engine: &coreml::CoreMlEngine,
     pcm: &[f32],
+    variants: usize,
     start: usize,
     end: usize,
     index: usize,
     total: usize,
-    stats: &mut RecoveryStats,
 ) -> Result<Vec<TimedToken>> {
-    let first = try_decode(
-        engine,
-        pcm,
-        start,
-        end,
-        coreml::LengthPolicy::ACTUAL,
-        start,
-        end,
-        index,
-        total,
-    )
-    .with_context(|| format!("CoreML inference failed (window {}/{})", index + 1, total))?;
-    if !first.gap {
-        return Ok(first.words);
-    }
-
-    let mut best = first;
     let rate = SAMPLE_RATE as i64;
-    let mut spans = vec![(start, end)];
-    for shift in SHIFTS_SECS {
-        let shifted = (start as i64 + shift * rate).clamp(0, pcm.len() as i64) as usize;
-        let span_end = (shifted + COREML_WINDOW_SAMPLES).min(pcm.len());
-        if span_end.saturating_sub(shifted) >= (MIN_RECOVERY_SECS * rate as f32) as usize {
-            spans.push((shifted, span_end));
+    let mut best: Option<Vec<TimedToken>> = None;
+    for &(shift, policy) in VARIANTS.iter().take(variants) {
+        let span_start = (start as i64 + shift * rate).clamp(0, pcm.len() as i64) as usize;
+        let span_end = (span_start + (end - start)).min(pcm.len());
+        let nominal = span_start == start && span_end == end;
+        if best.is_some() && shift != 0 && nominal {
+            continue; // clamped to the same cut as the first variant
+        }
+        if span_end <= span_start {
+            continue;
+        }
+        let words = engine
+            .transcribe_window(&pcm[span_start..span_end], policy)
+            .with_context(|| format!("CoreML inference failed (window {}/{})", index + 1, total))?;
+        let owned = own_words(
+            words,
+            span_start,
+            start,
+            end,
+            COREML_OVERLAP_SAMPLES,
+            index,
+            total,
+        );
+        if best.as_ref().is_none_or(|b| owned.len() > b.len()) {
+            best = Some(owned);
         }
     }
-    for (span_index, &(span_start, span_end)) in spans.iter().enumerate() {
-        let policies: Vec<coreml::LengthPolicy> = if span_index == 0 {
-            coreml::LengthPolicy::RECOVERY.to_vec()
-        } else {
-            std::iter::once(coreml::LengthPolicy::ACTUAL)
-                .chain(coreml::LengthPolicy::RECOVERY)
-                .collect()
-        };
-        for policy in policies {
-            let Some(candidate) = try_decode(
-                engine, pcm, span_start, span_end, policy, start, end, index, total,
-            ) else {
-                continue;
-            };
-            if !candidate.gap {
-                stats.recovered += 1;
-                return Ok(candidate.words);
-            }
-            if candidate.words.len() > best.words.len() {
-                best = candidate;
-            }
-        }
-    }
-    stats.unresolved += 1;
-    Ok(best.words)
+    Ok(best.unwrap_or_default())
+}
+
+/// Most windows decoded at once. Each worker loads its own copy of the models
+/// (they are memory-mapped, so this costs little RAM). Beyond about four the
+/// Neural Engine, which runs the encoder one window at a time, is the limit.
+const MAX_WINDOW_THREADS: usize = 4;
+
+/// Worker threads for `windows` windows.
+fn window_threads(windows: usize) -> usize {
+    let cores = thread::available_parallelism().map_or(1, |n| n.get());
+    cores.min(MAX_WINDOW_THREADS).min(windows).max(1)
 }
 
 /// Transcribe 16 kHz mono PCM with CoreML. The encoder only takes 15 second
 /// windows, so every file is windowed and stitched on word midpoints.
-fn transcribe_audio(pcm: &[f32], spinner: Option<&ProgressBar>) -> Result<(String, RecoveryStats)> {
+/// Transcribe 16 kHz mono PCM with CoreML. The encoder only takes 15 second
+/// windows, so the whole recording is cut into overlapping windows, every one
+/// is decoded as the model returns it, and the results are stitched on word
+/// midpoints.
+fn transcribe_audio(pcm: &[f32], variants: usize, spinner: Option<&ProgressBar>) -> Result<String> {
     if let Some(sp) = spinner {
         sp.set_message("Loading Parakeet TDT CoreML models...");
     }
     let dir = resolve_coreml_dir()
         .context("Failed to locate Parakeet CoreML models in 'models/coreml'")?;
-    let engine = coreml::CoreMlEngine::load(&dir)?;
 
     let spans = chunk_spans(pcm.len(), COREML_WINDOW_SAMPLES, COREML_OVERLAP_SAMPLES);
     let total = spans.len();
-    let mut stats = RecoveryStats::default();
-    let mut kept = Vec::new();
-    for (i, &(start, end)) in spans.iter().enumerate() {
-        if let Some(sp) = spinner {
-            sp.set_message(format!("Transcribing window {}/{}...", i + 1, total));
+    let threads = window_threads(total);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let slots: Mutex<Vec<Option<Vec<TimedToken>>>> = Mutex::new(vec![None; total]);
+    let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let engine = match coreml::CoreMlEngine::load(&dir) {
+                    Ok(engine) => engine,
+                    Err(e) => {
+                        first_error.lock().unwrap().get_or_insert(e);
+                        return;
+                    }
+                };
+                loop {
+                    if first_error.lock().unwrap().is_some() {
+                        return;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        return;
+                    }
+                    let (start, end) = spans[i];
+                    let decoded = decode_window(&engine, pcm, variants, start, end, i, total);
+                    match decoded {
+                        Ok(words) => {
+                            slots.lock().unwrap()[i] = Some(words);
+                            let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+                            if let Some(sp) = spinner {
+                                sp.set_message(format!(
+                                    "Transcribing window {}/{}...",
+                                    finished, total
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            first_error.lock().unwrap().get_or_insert(e);
+                            return;
+                        }
+                    }
+                }
+            });
         }
-        kept.extend(decode_window(
-            &engine, pcm, start, end, i, total, &mut stats,
-        )?);
+    });
+
+    if let Some(e) = first_error.into_inner().unwrap() {
+        return Err(e);
     }
-    Ok((join_words(&kept), stats))
+    let mut windows = Vec::with_capacity(total);
+    for slot in slots.into_inner().unwrap() {
+        windows.push(slot.context("Internal error: a window produced no result")?);
+    }
+    Ok(join_words(&merge_windows(windows)))
 }
 
 fn main() -> Result<()> {
@@ -632,14 +598,10 @@ fn main() -> Result<()> {
 
     // Step 2: Load the CoreML models and transcribe
     let t0 = Instant::now();
-    let (text, stats) = transcribe_audio(&audio.pcm_16k, spinner.as_ref())?;
+    let text = transcribe_audio(&audio.pcm_16k, cli.variants as usize, spinner.as_ref())?;
     let text = text.trim().to_string();
 
     let elapsed = t0.elapsed().as_secs_f64();
-
-    if let Some(sp) = spinner {
-        sp.finish_and_clear();
-    }
     let rtfx = if elapsed > 0.0 && audio.duration_secs > 0.0 {
         (audio.duration_secs / elapsed * 10.0).round() / 10.0
     } else {
@@ -666,12 +628,6 @@ fn main() -> Result<()> {
             "Speed: {:.1}x real-time ({:.2}s elapsed, {} words)",
             rtfx, elapsed, word_count
         );
-        if stats.recovered + stats.unresolved > 0 {
-            println!(
-                "Recovery: {} window(s) retried successfully, {} still incomplete",
-                stats.recovered, stats.unresolved
-            );
-        }
         println!();
         if text.is_empty() {
             println!("(No speech detected)");

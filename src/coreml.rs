@@ -14,9 +14,8 @@
 //! `Encoder_v2` is the int8 per-channel encoder. The original palettized
 //! `Encoder` mangles words near window edges (FluidAudio issue 760).
 //!
-//! The model has input cuts on which the joint never beats blank (FluidAudio
-//! issue 909), so callers should verify windows and retry with a
-//! `LengthPolicy` or a shifted cut when one looks wrong.
+//! A window can be decoded more than one way (`LengthPolicy`); every result is
+//! the model's own output, exactly as returned.
 
 use anyhow::{anyhow, bail, Context, Result};
 use coreml::prelude::*;
@@ -51,10 +50,14 @@ pub const FRAME_SECS: f32 = 0.08;
 pub type RawToken = (usize, usize, usize);
 
 fn load_model(path: &Path) -> Result<Model> {
+    load_model_with(path, ComputeUnits::All)
+}
+
+fn load_model_with(path: &Path, units: ComputeUnits) -> Result<Model> {
     if !path.exists() {
         bail!("CoreML model not found: {}", path.display());
     }
-    let configuration = ModelConfiguration::new().with_compute_units(ComputeUnits::All);
+    let configuration = ModelConfiguration::new().with_compute_units(units);
     Model::load_from_url(path, &configuration)
         .map_err(|e| anyhow!("Failed to load CoreML model {}: {}", path.display(), e))
 }
@@ -141,9 +144,9 @@ pub const TRIMMED_TAIL_SAMPLES: usize = 3_200;
 ///
 /// Parakeet TDT v3 has input cuts on which the joint never beats blank, and
 /// the output is on a knife edge with respect to the length inputs (FluidAudio
-/// issue 909; the ONNX build and the fp16 MLX port blank on the same cuts, so it
-/// is the model, not CoreML). Perturbing the declared lengths flips such a cut, and a
-/// good cut is never touched because these only run after a suspicious decode.
+/// issue 909; the ONNX build and the fp16 MLX port blank on the same cuts, so
+/// it is the model, not CoreML). Declaring the lengths differently flips such a
+/// cut, which makes it possible to decode a window more than one way.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LengthPolicy {
     /// Declare the whole 15 s valid to the preprocessor.
@@ -155,8 +158,14 @@ pub struct LengthPolicy {
 }
 
 impl LengthPolicy {
-    /// The normal path: declare the true length.
+    /// Declare the true length.
     pub const ACTUAL: Self = Self::new(false, false, false);
+    /// Declare the audio 0.2 s shorter.
+    pub const TRIMMED_TAIL: Self = Self::new(false, false, true);
+    /// Trimmed tail, with the whole mel length declared valid to the encoder.
+    pub const ENCODER_FULL_TRIMMED: Self = Self::new(false, true, true);
+    /// Trimmed tail, with the whole window declared valid to the preprocessor.
+    pub const PREPROCESSOR_FULL_TRIMMED: Self = Self::new(true, false, true);
 
     const fn new(preprocessor_full: bool, encoder_full: bool, trimmed_tail: bool) -> Self {
         Self {
@@ -165,16 +174,6 @@ impl LengthPolicy {
             trimmed_tail,
         }
     }
-
-    /// Recovery perturbations in the order they are tried. `trimmed_tail`
-    /// recovered every blank cut in testing, so it goes first.
-    pub const RECOVERY: [Self; 5] = [
-        Self::new(false, false, true),
-        Self::new(true, false, false),
-        Self::new(true, false, true),
-        Self::new(false, true, true),
-        Self::new(false, true, false),
-    ];
 }
 
 /// Samples the model is told the audio has under `policy`.
@@ -184,16 +183,6 @@ pub fn declared_samples(len: usize, policy: LengthPolicy) -> usize {
     } else {
         len
     }
-}
-
-/// One decoded window.
-pub struct WindowDecode {
-    /// Words with timestamps in seconds relative to the window start.
-    pub words: Vec<TimedToken>,
-    /// Number of tokens the joint emitted.
-    pub token_count: usize,
-    /// Mean joint probability of the emitted tokens.
-    pub mean_confidence: f32,
 }
 
 /// Loaded CoreML models plus the vocabulary.
@@ -210,21 +199,24 @@ impl CoreMlEngine {
         Ok(Self {
             preprocessor: load_model(&dir.join("Preprocessor.mlmodelc"))?,
             encoder: load_model(&dir.join("Encoder_v2.mlmodelc"))?,
-            decoder: load_model(&dir.join("Decoder.mlmodelc"))?,
-            joint: load_model(&dir.join("JointDecision.mlmodelc"))?,
+            // The decoder and joint network are tiny and called thousands of
+            // times per file. On the CPU they skip Neural Engine dispatch
+            // latency, which dominated their runtime.
+            decoder: load_model_with(&dir.join("Decoder.mlmodelc"), ComputeUnits::CpuOnly)?,
+            joint: load_model_with(&dir.join("JointDecision.mlmodelc"), ComputeUnits::CpuOnly)?,
             vocab: load_vocab(&dir.join("parakeet_v3_vocab.json"))?,
         })
     }
 
     /// Transcribe at most one window of 16 kHz mono audio. Words carry
     /// timestamps in seconds relative to the start of `samples`.
-    pub fn transcribe_window(&self, samples: &[f32], policy: LengthPolicy) -> Result<WindowDecode> {
+    pub fn transcribe_window(
+        &self,
+        samples: &[f32],
+        policy: LengthPolicy,
+    ) -> Result<Vec<TimedToken>> {
         if samples.is_empty() {
-            return Ok(WindowDecode {
-                words: Vec::new(),
-                token_count: 0,
-                mean_confidence: 0.0,
-            });
+            return Ok(Vec::new());
         }
         if samples.len() > WINDOW_SAMPLES {
             bail!(
@@ -235,17 +227,8 @@ impl CoreMlEngine {
         }
 
         let (encoder_out, frames) = self.encode(samples, policy)?;
-        let (tokens, probs) = self.decode(&encoder_out, frames)?;
-        let mean_confidence = if probs.is_empty() {
-            0.0
-        } else {
-            probs.iter().sum::<f32>() / probs.len() as f32
-        };
-        Ok(WindowDecode {
-            words: tokens_to_words(&tokens, &self.vocab),
-            token_count: tokens.len(),
-            mean_confidence,
-        })
+        let tokens = self.decode(&encoder_out, frames)?;
+        Ok(tokens_to_words(&tokens, &self.vocab))
     }
 
     /// Audio to encoder frames laid out as `[frame][ENCODER_DIM]`.
@@ -304,7 +287,7 @@ impl CoreMlEngine {
     }
 
     /// Greedy TDT decoding over the encoder frames.
-    fn decode(&self, frames: &[f32], count: usize) -> Result<(Vec<RawToken>, Vec<f32>)> {
+    fn decode(&self, frames: &[f32], count: usize) -> Result<Vec<RawToken>> {
         let zeros = vec![0f32; LSTM_LAYERS * DECODER_DIM];
         let mut h = f32_array(&[LSTM_LAYERS, 1, DECODER_DIM], &zeros)?;
         let mut c = f32_array(&[LSTM_LAYERS, 1, DECODER_DIM], &zeros)?;
@@ -313,7 +296,6 @@ impl CoreMlEngine {
         let mut pending: Option<(MultiArray, MultiArray, MultiArray)> = None;
 
         let mut tokens = Vec::new();
-        let mut probs = Vec::new();
         let mut t = 0;
         let mut emitted = 0;
 
@@ -335,7 +317,6 @@ impl CoreMlEngine {
                 ));
             }
             let (decoder_step, next_h, next_c) = pending.as_ref().expect("decoder output cached");
-
             let joint = predict(
                 &self.joint,
                 vec![
@@ -354,12 +335,9 @@ impl CoreMlEngine {
             )?;
             let token = scalar(&output_view(&joint, "token_id")?)?.max(0) as usize;
             let duration = scalar(&output_view(&joint, "duration")?)?.max(0) as usize;
-            let prob_view = output_view(&joint, "token_prob")?;
-            let prob = to_f32(&prob_view)?.first().copied().unwrap_or(0.0);
 
             if token != BLANK_ID {
                 tokens.push((token, t, duration));
-                probs.push(prob);
                 last_token = token;
                 h = next_h.copy_to_owned().map_err(|e| anyhow!("{e}"))?;
                 c = next_c.copy_to_owned().map_err(|e| anyhow!("{e}"))?;
@@ -375,7 +353,7 @@ impl CoreMlEngine {
                 emitted = 0;
             }
         }
-        Ok((tokens, probs))
+        Ok(tokens)
     }
 }
 
