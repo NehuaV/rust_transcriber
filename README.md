@@ -40,7 +40,7 @@ flowchart TD
 
     subgraph Chunking["4. transcribe_pcm: chunked path"]
         direction TB
-        Spans["chunk_spans<br/>5 min windows, 15 s overlap"] --> Loop["For each chunk:<br/>transcribe_samples with word timestamps"]
+        Spans["chunk_spans<br/>5 min windows, 15 s overlap"] --> Loop["For each chunk:<br/>transcribe_chunk with word timestamps"]
         Loop --> Fold["fold_trailing_punctuation<br/>attach . , ! ? to previous word"]
         Fold --> Keep["absolute_keep_window<br/>keep words whose midpoint is<br/>inside this chunk's half of the overlap"]
         Keep --> Loop
@@ -165,7 +165,7 @@ transcribe audio.m4a -q
 transcribe audio.wav -q | pbcopy
 ```
 
-Long recordings (for example a 48 minute lecture) work the same way; chunking is automatic.
+Long recordings (for example a 48 minute lecture) work without any flag; chunking is automatic.
 
 ### Options
 

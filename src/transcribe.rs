@@ -345,12 +345,61 @@ fn join_words(words: &[TimedToken]) -> String {
     out
 }
 
+/// Transcribe one window and return only the words this chunk owns, with
+/// timestamps shifted to the whole recording.
+fn transcribe_chunk(
+    model: &mut ParakeetTDT,
+    pcm: &[f32],
+    index: usize,
+    total: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<TimedToken>> {
+    let steps = encoder_steps(end - start);
+    if steps > MAX_ENCODER_STEPS {
+        bail!(
+            "Internal error: chunk of {} samples is {} encoder steps, above the {} step limit",
+            end - start,
+            steps,
+            MAX_ENCODER_STEPS
+        );
+    }
+    let result = model
+        .transcribe_samples(
+            pcm[start..end].to_vec(),
+            SAMPLE_RATE,
+            1,
+            Some(TimestampMode::Words),
+        )
+        .with_context(|| {
+            format!(
+                "Transcription failed during inference (chunk {}/{}, samples {}..{})",
+                index + 1,
+                total,
+                start,
+                end
+            )
+        })?;
+
+    let (keep_from, keep_to) = absolute_keep_window(start, end, index == 0, index + 1 == total);
+    let offset = start as f32 / SAMPLE_RATE as f32;
+    let mut kept = Vec::new();
+    for word in fold_trailing_punctuation(result.tokens) {
+        let mid = offset + (word.start + word.end) * 0.5;
+        if mid >= keep_from && mid < keep_to && !word.text.trim().is_empty() {
+            kept.push(word);
+        }
+    }
+    Ok(kept)
+}
+
 /// Transcribe 16 kHz mono PCM. Files that fit in the positional embedding run
-/// in one pass. Longer files are cut into overlapping windows and stitched on
-/// word midpoints so a word on a boundary is emitted once.
+/// in one pass. Longer files are cut into overlapping windows, transcribed one
+/// at a time, and stitched on word midpoints so a word on a boundary is
+/// emitted once.
 fn transcribe_pcm(
     model: &mut ParakeetTDT,
-    pcm: Vec<f32>,
+    pcm: &[f32],
     spinner: Option<&ProgressBar>,
 ) -> Result<String> {
     if pcm.len() <= MAX_SAMPLES {
@@ -358,48 +407,19 @@ fn transcribe_pcm(
             sp.set_message("Transcribing...");
         }
         let result = model
-            .transcribe_samples(pcm, SAMPLE_RATE, 1, None)
+            .transcribe_samples(pcm.to_vec(), SAMPLE_RATE, 1, None)
             .context("Transcription failed during inference")?;
         return Ok(result.text);
     }
 
     let spans = chunk_spans(pcm.len(), CHUNK_SAMPLES, OVERLAP_SAMPLES);
+    let total = spans.len();
     let mut kept = Vec::new();
     for (i, &(start, end)) in spans.iter().enumerate() {
         if let Some(sp) = spinner {
-            sp.set_message(format!("Transcribing chunk {}/{}...", i + 1, spans.len()));
+            sp.set_message(format!("Transcribing chunk {}/{}...", i + 1, total));
         }
-
-        let steps = encoder_steps(end - start);
-        if steps > MAX_ENCODER_STEPS {
-            bail!(
-                "Internal error: chunk of {} samples is {} encoder steps, above the {} step limit",
-                end - start,
-                steps,
-                MAX_ENCODER_STEPS
-            );
-        }
-        let chunk = pcm[start..end].to_vec();
-        let result = model
-            .transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Words))
-            .with_context(|| {
-                format!(
-                    "Transcription failed during inference (chunk {}/{}, samples {}..{})",
-                    i + 1,
-                    spans.len(),
-                    start,
-                    end
-                )
-            })?;
-
-        let (keep_from, keep_to) = absolute_keep_window(start, end, i == 0, i + 1 == spans.len());
-        let offset = start as f32 / SAMPLE_RATE as f32;
-        for word in fold_trailing_punctuation(result.tokens) {
-            let mid = offset + (word.start + word.end) * 0.5;
-            if mid >= keep_from && mid < keep_to && !word.text.trim().is_empty() {
-                kept.push(word);
-            }
-        }
+        kept.extend(transcribe_chunk(model, pcm, i, total, start, end)?);
     }
 
     Ok(join_words(&kept))
@@ -456,7 +476,7 @@ fn main() -> Result<()> {
     let mut model = ParakeetTDT::from_pretrained(&model_dir, Some(config))
         .context("Failed to load ParakeetTDT model from 'models/basic'")?;
 
-    let text = transcribe_pcm(&mut model, audio.pcm_16k, spinner.as_ref())?
+    let text = transcribe_pcm(&mut model, &audio.pcm_16k, spinner.as_ref())?
         .trim()
         .to_string();
 
