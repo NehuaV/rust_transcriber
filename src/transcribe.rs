@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use indicatif::{ProgressBar, ProgressStyle};
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -35,9 +35,15 @@ struct Cli {
 /// Uses local disk weights without looking at .cache or making network requests.
 fn resolve_model_dir() -> Result<PathBuf> {
     // 1. Check environment variable override
-    if let Ok(dir_str) = std::env::var("PARAKEET_MODEL_DIR").or_else(|_| std::env::var("MODELS_DIR")) {
+    if let Ok(dir_str) =
+        std::env::var("PARAKEET_MODEL_DIR").or_else(|_| std::env::var("MODELS_DIR"))
+    {
         let p = PathBuf::from(dir_str);
-        let candidate = if p.join("vocab.txt").exists() { p } else { p.join("basic") };
+        let candidate = if p.join("vocab.txt").exists() {
+            p
+        } else {
+            p.join("basic")
+        };
         if candidate.join("vocab.txt").exists() {
             return Ok(candidate);
         }
@@ -227,6 +233,178 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// 16 kHz mono, matching the Parakeet TDT preprocessor.
+const SAMPLE_RATE: u32 = 16_000;
+/// Mel hop used by the TDT preprocessor. Mel frames are `samples / HOP_LENGTH`.
+const HOP_LENGTH: usize = 160;
+/// Encoder steps the exported relative-position table can attend over.
+///
+/// The table is `[1, 9999, 1024]`, sliced around a center of 5000. Attention
+/// then adds that slice (`2 * steps - 1` wide) onto scores of the same width.
+/// Past 5000 steps the slice stays 9999 wide and the add cannot broadcast.
+const MAX_ENCODER_STEPS: i64 = 5_000;
+/// 6_400_000 samples is exactly 5000 encoder steps. The next hop is 5001.
+const MAX_SAMPLES: usize = 6_400_000;
+/// Five minutes. Stays under the positional-embedding limit and matches the
+/// chunk length recommended for this model.
+const CHUNK_SAMPLES: usize = 5 * 60 * SAMPLE_RATE as usize;
+/// Shared audio on each side of a cut so a word on the boundary is fully
+/// inside the chunk that owns it.
+const OVERLAP_SAMPLES: usize = 15 * SAMPLE_RATE as usize;
+
+/// Encoder length for `samples` of 16 kHz audio: `1 + (mel_frames - 1) / 8`.
+fn encoder_steps(samples: usize) -> i64 {
+    let mel_frames = (samples / HOP_LENGTH) as i64;
+    if mel_frames <= 0 {
+        0
+    } else {
+        1 + (mel_frames - 1) / 8
+    }
+}
+
+/// Half-open sample ranges of at most `chunk_len`, each overlapping the next
+/// by `overlap` samples. The last range always runs through `total`.
+fn chunk_spans(total: usize, chunk_len: usize, overlap: usize) -> Vec<(usize, usize)> {
+    assert!(chunk_len > overlap, "chunk length must exceed overlap");
+    if total == 0 {
+        return Vec::new();
+    }
+    if total <= chunk_len {
+        return vec![(0, total)];
+    }
+
+    let stride = chunk_len - overlap;
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let end = (start + chunk_len).min(total);
+        spans.push((start, end));
+        if end == total {
+            break;
+        }
+        start += stride;
+    }
+    spans
+}
+
+/// Absolute time window `[from, to)` whose words belong to this chunk.
+///
+/// The cut sits in the middle of the overlap. Each chunk extends `overlap / 2`
+/// past that cut, so a word assigned by its midpoint was heard in full.
+/// The last chunk keeps every remaining word, including timestamps that land
+/// slightly past the final sample.
+fn absolute_keep_window(start: usize, end: usize, is_first: bool, is_last: bool) -> (f32, f32) {
+    let rate = SAMPLE_RATE as f32;
+    let half_overlap = (OVERLAP_SAMPLES / 2) as f32 / rate;
+    let from = if is_first {
+        0.0
+    } else {
+        start as f32 / rate + half_overlap
+    };
+    let to = if is_last {
+        f32::MAX
+    } else {
+        end as f32 / rate - half_overlap
+    };
+    (from, to)
+}
+
+fn is_trailing_punct(text: &str) -> bool {
+    text.len() == 1
+        && text
+            .chars()
+            .all(|c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')'))
+}
+
+/// Glue trailing punctuation onto the previous word and keep that word's timing,
+/// so a period that lands just past a chunk cut stays with the word it closes.
+fn fold_trailing_punctuation(words: Vec<TimedToken>) -> Vec<TimedToken> {
+    let mut out: Vec<TimedToken> = Vec::with_capacity(words.len());
+    for word in words {
+        if is_trailing_punct(&word.text) {
+            if let Some(prev) = out.last_mut() {
+                prev.text.push_str(&word.text);
+                continue;
+            }
+        }
+        out.push(word);
+    }
+    out
+}
+
+/// Join word tokens the same way `parakeet-rs` rebuilds `TimestampMode::Words`.
+fn join_words(words: &[TimedToken]) -> String {
+    let mut out = String::new();
+    for (i, word) in words.iter().enumerate() {
+        let text = word.text.as_str();
+        if i > 0 && !is_trailing_punct(text) {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    out
+}
+
+/// Transcribe 16 kHz mono PCM. Files that fit in the positional embedding run
+/// in one pass. Longer files are cut into overlapping windows and stitched on
+/// word midpoints so a word on a boundary is emitted once.
+fn transcribe_pcm(
+    model: &mut ParakeetTDT,
+    pcm: Vec<f32>,
+    spinner: Option<&ProgressBar>,
+) -> Result<String> {
+    if pcm.len() <= MAX_SAMPLES {
+        if let Some(sp) = spinner {
+            sp.set_message("Transcribing...");
+        }
+        let result = model
+            .transcribe_samples(pcm, SAMPLE_RATE, 1, None)
+            .context("Transcription failed during inference")?;
+        return Ok(result.text);
+    }
+
+    let spans = chunk_spans(pcm.len(), CHUNK_SAMPLES, OVERLAP_SAMPLES);
+    let mut kept = Vec::new();
+    for (i, &(start, end)) in spans.iter().enumerate() {
+        if let Some(sp) = spinner {
+            sp.set_message(format!("Transcribing chunk {}/{}...", i + 1, spans.len()));
+        }
+
+        let steps = encoder_steps(end - start);
+        if steps > MAX_ENCODER_STEPS {
+            bail!(
+                "Internal error: chunk of {} samples is {} encoder steps, above the {} step limit",
+                end - start,
+                steps,
+                MAX_ENCODER_STEPS
+            );
+        }
+        let chunk = pcm[start..end].to_vec();
+        let result = model
+            .transcribe_samples(chunk, SAMPLE_RATE, 1, Some(TimestampMode::Words))
+            .with_context(|| {
+                format!(
+                    "Transcription failed during inference (chunk {}/{}, samples {}..{})",
+                    i + 1,
+                    spans.len(),
+                    start,
+                    end
+                )
+            })?;
+
+        let (keep_from, keep_to) = absolute_keep_window(start, end, i == 0, i + 1 == spans.len());
+        let offset = start as f32 / SAMPLE_RATE as f32;
+        for word in fold_trailing_punctuation(result.tokens) {
+            let mid = offset + (word.start + word.end) * 0.5;
+            if mid >= keep_from && mid < keep_to && !word.text.trim().is_empty() {
+                kept.push(word);
+            }
+        }
+    }
+
+    Ok(join_words(&kept))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -278,21 +456,15 @@ fn main() -> Result<()> {
     let mut model = ParakeetTDT::from_pretrained(&model_dir, Some(config))
         .context("Failed to load ParakeetTDT model from 'models/basic'")?;
 
-    if let Some(ref sp) = spinner {
-        sp.set_message("Transcribing...");
-    }
-
-    let result = model
-        .transcribe_samples(audio.pcm_16k, 16000, 1, None)
-        .context("Transcription failed during inference")?;
+    let text = transcribe_pcm(&mut model, audio.pcm_16k, spinner.as_ref())?
+        .trim()
+        .to_string();
 
     let elapsed = t0.elapsed().as_secs_f64();
 
     if let Some(sp) = spinner {
         sp.finish_and_clear();
     }
-
-    let text = result.text.trim().to_string();
     let rtfx = if elapsed > 0.0 && audio.duration_secs > 0.0 {
         (audio.duration_secs / elapsed * 10.0).round() / 10.0
     } else {
@@ -339,3 +511,7 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "transcribe_tests.rs"]
+mod tests;

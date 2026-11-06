@@ -99,8 +99,8 @@ fn find_models_dir() -> PathBuf {
 
 /// Computes a hash of the file contents using standard library `std::hash::DefaultHasher`.
 fn compute_std_hash(path: &Path) -> Result<u64, String> {
-    let mut file = File::open(path)
-        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let mut file =
+        File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
     let mut hasher = DefaultHasher::new();
     let mut buffer = [0u8; 64 * 1024];
     loop {
@@ -146,7 +146,11 @@ fn download_file(
     }
 
     let pid = std::process::id();
-    let file_name = dest_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+    let file_name = dest_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
     let temp_name = format!("{}.download.{}.tmp", file_name, pid);
     let temp_path = dest_path.with_file_name(temp_name);
 
@@ -156,18 +160,26 @@ fn download_file(
     eprintln!("Downloading {} ...\n  URL: {}", file_name, url);
 
     let status = Command::new("curl")
-        .arg("-L")              // Follow redirects
-        .arg("--fail")          // Fail on HTTP 4xx/5xx
-        .arg("--progress-bar")  // Clean progress display
+        .arg("-L") // Follow redirects
+        .arg("--fail") // Fail on HTTP 4xx/5xx
+        .arg("--progress-bar") // Clean progress display
         .arg("-o")
         .arg(&temp_path)
         .arg(url)
         .status()
-        .map_err(|e| format!("Failed to execute curl: {}. Please ensure 'curl' is installed.", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to execute curl: {}. Please ensure 'curl' is installed.",
+                e
+            )
+        })?;
 
     if !status.success() {
         let _ = fs::remove_file(&temp_path);
-        return Err(format!("curl download failed with exit code: {:?}", status.code()));
+        return Err(format!(
+            "curl download failed with exit code: {:?}",
+            status.code()
+        ));
     }
 
     // Verify downloaded file size
@@ -175,7 +187,11 @@ fn download_file(
         Ok(meta) => meta.len(),
         Err(e) => {
             let _ = fs::remove_file(&temp_path);
-            return Err(format!("Failed to read metadata of {}: {}", temp_path.display(), e));
+            return Err(format!(
+                "Failed to read metadata of {}: {}",
+                temp_path.display(),
+                e
+            ));
         }
     };
 
@@ -192,7 +208,11 @@ fn download_file(
         Ok(h) => h,
         Err(e) => {
             let _ = fs::remove_file(&temp_path);
-            return Err(format!("Failed to compute hash for {}: {}", temp_path.display(), e));
+            return Err(format!(
+                "Failed to compute hash for {}: {}",
+                temp_path.display(),
+                e
+            ));
         }
     };
 
@@ -215,7 +235,10 @@ fn download_file(
         )
     })?;
 
-    eprintln!("Downloaded and verified: {} (hash: {:016x})", file_name, downloaded_hash);
+    eprintln!(
+        "Downloaded and verified: {} (hash: {:016x})",
+        file_name, downloaded_hash
+    );
     Ok(())
 }
 
@@ -242,12 +265,7 @@ fn check_and_download_group(
 
         for model in &missing {
             let dest = models_dir.join(model.rel_path);
-            download_file(
-                model.url,
-                &dest,
-                model.expected_size,
-                model.expected_hash,
-            )?;
+            download_file(model.url, &dest, model.expected_size, model.expected_hash)?;
         }
     }
 
