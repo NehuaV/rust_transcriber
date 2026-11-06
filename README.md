@@ -4,7 +4,7 @@ Offline speech-to-text CLI for macOS, written in Rust. It runs NVIDIA Parakeet T
 
 | Binary | Source | Model |
 | :--- | :--- | :--- |
-| `transcribe` | `src/transcribe.rs`, `src/coreml.rs` | NVIDIA Parakeet TDT 0.6B v3, CoreML export by FluidInference |
+| `transcribe` | `src/transcribe.rs` and the modules it declares | NVIDIA Parakeet TDT 0.6B v3, CoreML export by FluidInference |
 
 macOS only (Apple Silicon recommended).
 
@@ -197,7 +197,7 @@ cargo run --bin download-models
 
 ### 3. Run tests
 
-Unit tests live in `src/transcribe_tests.rs` (windowing and stitching) and `src/coreml_tests.rs` (CoreML word assembly):
+Each module keeps its unit tests in a sibling `*_tests.rs` file (`audio`, `coreml`, `models`, `pipeline`, `window`, `word` and the CLI in `transcribe`). The audio tests write and decode real WAV files:
 
 ```bash
 cargo test --bin transcribe
@@ -248,11 +248,12 @@ Options:
 
 ```
 .
-├── Cargo.toml               # Cargo package configuration
+├── Cargo.toml               # Cargo package configuration and lints
 ├── README.md                # Project documentation
 ├── AGENTS.md                # Agent guidelines and project structure notes
 ├── export.sh                # Installation script for ~/.local/bin
 ├── start.sh                 # Local launcher script
+├── .github/workflows/       # CI: formatting, clippy and unit tests
 ├── audio/                   # Sample audio files for testing
 ├── models/
 │   └── coreml/              # Parakeet TDT 0.6B v3 CoreML bundles
@@ -262,10 +263,14 @@ Options:
 │       ├── JointDecision.mlmodelc/
 │       └── parakeet_v3_vocab.json
 ├── src/
-│   ├── transcribe.rs        # CLI, decoding, windowing, variants, threads and stitching
-│   ├── coreml.rs            # CoreML engine: models, TDT decode loop, word assembly
-│   ├── transcribe_tests.rs  # Tests for windowing and stitching
-│   └── coreml_tests.rs      # Tests for CoreML word assembly
+│   ├── transcribe.rs        # Entry point: command line, status line, report
+│   ├── audio.rs             # Decode any file to 16 kHz mono samples (FFmpeg)
+│   ├── models.rs            # Find the model files on disk
+│   ├── coreml.rs            # CoreML models, TDT decode loop, vocabulary
+│   ├── window.rs            # Cut audio into overlapping windows, stitch words
+│   ├── pipeline.rs          # Variants, worker threads, picking the fullest result
+│   ├── word.rs              # Words with timestamps and their text operations
+│   └── *_tests.rs           # Unit tests, one file per module
 └── scripts/
     ├── build.rs             # Cargo build script for checking/downloading models
     └── download_models.rs   # Standalone runner for model downloading

@@ -353,17 +353,25 @@ fn check_and_download_group(
 pub fn main() {
     // Tell Cargo to re-run this build script only if the models directory changes
     println!("cargo:rerun-if-changed=models");
-
-    let models_dir = find_models_dir();
-    fs::create_dir_all(&models_dir).ok();
-
-    eprintln!("Checking models in {}...", models_dir.display());
+    println!("cargo:rerun-if-env-changed=SKIP_MODEL_DOWNLOAD");
 
     // The CoreML framework links Swift's runtime by @rpath; macOS ships it in
     // /usr/lib/swift.
     println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/usr/lib/swift");
     // The statically linked FFmpeg contains C++ code that needs libc++.
     println!("cargo:rustc-link-lib=c++");
+
+    // CI runs the unit tests, which load no model, so it can skip the download
+    // of about 0.65 GB.
+    if std::env::var_os("SKIP_MODEL_DOWNLOAD").is_some() {
+        eprintln!("SKIP_MODEL_DOWNLOAD is set: not checking models.");
+        return;
+    }
+
+    let models_dir = find_models_dir();
+    fs::create_dir_all(&models_dir).ok();
+
+    eprintln!("Checking models in {}...", models_dir.display());
 
     if let Err(e) = check_and_download_group(&models_dir, COREML_MODELS, "coreml") {
         eprintln!("error: failed to prepare CoreML models: {}", e);
