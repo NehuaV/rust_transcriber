@@ -1,6 +1,6 @@
 //! Build script and standalone model downloader for Transcriber CLI.
 //!
-//! Checks if required ONNX models exist in `models/basic`.
+//! Checks that the CoreML bundles in `models/coreml` exist.
 //! If they are already present and match exact sizes and standard library hashes, exits immediately.
 //! If missing or corrupted, downloads them directly from official Hugging Face repositories.
 
@@ -17,24 +17,128 @@ struct ModelFile {
     expected_hash: u64,
 }
 
-const BASIC_MODELS: &[ModelFile] = &[
+/// Parakeet TDT 0.6B v3 CoreML export (FluidInference). `Encoder_v2` is the
+/// int8 per-channel encoder that fixes window-edge word errors in the original.
+const COREML_MODELS: &[ModelFile] = &[
     ModelFile {
-        rel_path: "basic/vocab.txt",
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-        expected_size: 93_939,
-        expected_hash: 0xc448_610b_3c14_a06e,
+        rel_path: "coreml/Decoder.mlmodelc/analytics/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Decoder.mlmodelc/analytics/coremldata.bin",
+        expected_size: 243,
+        expected_hash: 0x2332_3859_f576_5030,
     },
     ModelFile {
-        rel_path: "basic/decoder_joint-model.int8.onnx",
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-        expected_size: 18_202_004,
-        expected_hash: 0xab41_86fc_9cbb_0a76,
+        rel_path: "coreml/Decoder.mlmodelc/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Decoder.mlmodelc/coremldata.bin",
+        expected_size: 554,
+        expected_hash: 0xa6a9_f8b2_b5a6_89b8,
     },
     ModelFile {
-        rel_path: "basic/encoder-model.int8.onnx",
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-        expected_size: 652_183_999,
-        expected_hash: 0x5565_3a37_d4ab_d343,
+        rel_path: "coreml/Decoder.mlmodelc/metadata.json",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Decoder.mlmodelc/metadata.json",
+        expected_size: 3_427,
+        expected_hash: 0x1304_903a_e1b8_4cf6,
+    },
+    ModelFile {
+        rel_path: "coreml/Decoder.mlmodelc/model.mil",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Decoder.mlmodelc/model.mil",
+        expected_size: 13_110,
+        expected_hash: 0xefc2_1a87_9f11_ba7e,
+    },
+    ModelFile {
+        rel_path: "coreml/Decoder.mlmodelc/weights/weight.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Decoder.mlmodelc/weights/weight.bin",
+        expected_size: 23_604_992,
+        expected_hash: 0xbb12_b352_be95_c813,
+    },
+    ModelFile {
+        rel_path: "coreml/Encoder_v2.mlmodelc/analytics/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Encoder_v2.mlmodelc/analytics/coremldata.bin",
+        expected_size: 243,
+        expected_hash: 0x94f9_a8ab_bbd9_53ed,
+    },
+    ModelFile {
+        rel_path: "coreml/Encoder_v2.mlmodelc/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Encoder_v2.mlmodelc/coremldata.bin",
+        expected_size: 478,
+        expected_hash: 0xce0d_2203_ec1a_be0f,
+    },
+    ModelFile {
+        rel_path: "coreml/Encoder_v2.mlmodelc/model.mil",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Encoder_v2.mlmodelc/model.mil",
+        expected_size: 1_002_653,
+        expected_hash: 0xd3e1_b5e4_bfc3_a856,
+    },
+    ModelFile {
+        rel_path: "coreml/Encoder_v2.mlmodelc/weights/weight.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Encoder_v2.mlmodelc/weights/weight.bin",
+        expected_size: 594_211_328,
+        expected_hash: 0x2126_0e3e_5f5a_1c6b,
+    },
+    ModelFile {
+        rel_path: "coreml/JointDecision.mlmodelc/analytics/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/JointDecision.mlmodelc/analytics/coremldata.bin",
+        expected_size: 243,
+        expected_hash: 0x1e49_2793_ded8_4e93,
+    },
+    ModelFile {
+        rel_path: "coreml/JointDecision.mlmodelc/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/JointDecision.mlmodelc/coremldata.bin",
+        expected_size: 534,
+        expected_hash: 0xe678_3b6a_11a3_0b20,
+    },
+    ModelFile {
+        rel_path: "coreml/JointDecision.mlmodelc/metadata.json",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/JointDecision.mlmodelc/metadata.json",
+        expected_size: 2_936,
+        expected_hash: 0x8fb4_eb41_ce4a_cca9,
+    },
+    ModelFile {
+        rel_path: "coreml/JointDecision.mlmodelc/model.mil",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/JointDecision.mlmodelc/model.mil",
+        expected_size: 9_723,
+        expected_hash: 0x6691_29f7_6dd4_e7c5,
+    },
+    ModelFile {
+        rel_path: "coreml/JointDecision.mlmodelc/weights/weight.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/JointDecision.mlmodelc/weights/weight.bin",
+        expected_size: 12_642_764,
+        expected_hash: 0x823e_7ce6_7b69_035e,
+    },
+    ModelFile {
+        rel_path: "coreml/Preprocessor.mlmodelc/analytics/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Preprocessor.mlmodelc/analytics/coremldata.bin",
+        expected_size: 243,
+        expected_hash: 0x88ac_15e9_4a10_4d1b,
+    },
+    ModelFile {
+        rel_path: "coreml/Preprocessor.mlmodelc/coremldata.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Preprocessor.mlmodelc/coremldata.bin",
+        expected_size: 486,
+        expected_hash: 0xb033_4690_afd3_86a5,
+    },
+    ModelFile {
+        rel_path: "coreml/Preprocessor.mlmodelc/metadata.json",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Preprocessor.mlmodelc/metadata.json",
+        expected_size: 2_841,
+        expected_hash: 0x9b49_43e6_eafc_7a1a,
+    },
+    ModelFile {
+        rel_path: "coreml/Preprocessor.mlmodelc/model.mil",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Preprocessor.mlmodelc/model.mil",
+        expected_size: 28_181,
+        expected_hash: 0x50b8_d74d_7e9b_40e4,
+    },
+    ModelFile {
+        rel_path: "coreml/Preprocessor.mlmodelc/weights/weight.bin",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/Preprocessor.mlmodelc/weights/weight.bin",
+        expected_size: 491_072,
+        expected_hash: 0x4073_accd_7d37_b82c,
+    },
+    ModelFile {
+        rel_path: "coreml/parakeet_v3_vocab.json",
+        url: "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/parakeet_v3_vocab.json",
+        expected_size: 151_122,
+        expected_hash: 0x2b2b_f8e6_57e9_4102,
     },
 ];
 
@@ -255,10 +359,15 @@ pub fn main() {
 
     eprintln!("Checking models in {}...", models_dir.display());
 
-    if let Err(e) = check_and_download_group(&models_dir, BASIC_MODELS, "basic") {
-        eprintln!("error: failed to prepare basic models: {}", e);
+    // The CoreML framework links Swift's runtime by @rpath; macOS ships it in
+    // /usr/lib/swift.
+    println!("cargo:rustc-link-arg-bins=-Wl,-rpath,/usr/lib/swift");
+    // The statically linked FFmpeg contains C++ code that needs libc++.
+    println!("cargo:rustc-link-lib=c++");
+
+    if let Err(e) = check_and_download_group(&models_dir, COREML_MODELS, "coreml") {
+        eprintln!("error: failed to prepare CoreML models: {}", e);
         std::process::exit(1);
     }
-
     eprintln!("All models verified in models/.\n");
 }

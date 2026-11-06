@@ -1,19 +1,32 @@
 # Transcriber
 
-Offline speech-to-text CLI written in Rust, built on the NVIDIA Parakeet TDT 0.6B v3 model via `parakeet-rs` and statically linked FFmpeg.
+Offline speech-to-text CLI for macOS, written in Rust. It runs NVIDIA Parakeet TDT 0.6B v3 on Apple's CoreML (Neural Engine, GPU and CPU) and decodes audio with statically linked FFmpeg.
 
-| Binary | Source | Model | Description |
-| :--- | :--- | :--- | :--- |
-| `transcribe` | `src/transcribe.rs` | NVIDIA Parakeet TDT 0.6B v3 | Batch speech recognition with automatic chunking for long audio |
+| Binary | Source | Model |
+| :--- | :--- | :--- |
+| `transcribe` | `src/transcribe.rs`, `src/coreml.rs` | NVIDIA Parakeet TDT 0.6B v3, CoreML export by FluidInference |
+
+macOS only (Apple Silicon recommended).
 
 ---
 
 ## Architecture
 
-- **Static FFmpeg linking**: Decoders and resamplers are statically compiled into the binary via `ffmpeg-sys-next`. No system `ffmpeg` binary or dynamic library installation is required at runtime.
-- **Local model evaluation**: ONNX models run locally via ONNX Runtime without network access or disk writes to `~/.cache`.
-- **Automatic model download**: A build script (`scripts/build.rs`) downloads required model weights on first build if they are not already present in `models/`.
-- **Long audio chunking**: The Parakeet TDT encoder cannot attend over more than about 5000 encoder steps (about 400 seconds) per call. Longer audio is split into overlapping windows and stitched back together.
+- **CoreML inference**: the preprocessor, encoder, decoder and joint network run through the `coreml` crate. The TDT decode loop is written in Rust (`src/coreml.rs`).
+- **Static FFmpeg linking**: decoders and resamplers are compiled into the binary via `ffmpeg-sys-next`. No system `ffmpeg` is needed at runtime.
+- **Local models only**: weights load from `models/coreml/` on disk. No network access or `~/.cache` writes at runtime.
+- **Automatic model download**: `scripts/build.rs` downloads and verifies the CoreML weights on first build.
+
+### Why every window is checked
+
+The CoreML encoder has a fixed 15 second input, so audio is split into overlapping 15 second windows. Parakeet TDT v3 also has input cuts on which the joint network never beats blank, so a window of clear speech can decode to nothing (FluidAudio issue 909). This is a property of the model, not of CoreML: the ONNX build of the model blanked on the same isolated cut. Without any checks, a test file lost about 16% of its words.
+
+So `transcribe` checks every window against the audio. A window is suspicious when a stretch of at least 1.5 seconds with speech-level energy contains no words. A suspicious window is retried until a result has no gap:
+
+1. **Length policies**: decode again with perturbed length declarations (declare the audio 0.2 s shorter, declare the whole window valid to the preprocessor or the encoder, and combinations). A retry is only trusted when it emits at least 2 tokens with mean confidence of 0.7 or more.
+2. **Shifted cuts**: decode the window again with its start shifted by -1, +1, -2, +2, -3 and +3 seconds, trying the actual length and every length policy for each cut.
+
+The checks only add text where the model produced none. Words the model did produce are never edited or removed, apart from overlap stitching (each word is kept by exactly one window). If a window still has a gap after every attempt, the attempt with the most words is kept and the run reports it.
 
 ### `transcribe` pipeline
 
@@ -25,33 +38,34 @@ flowchart TD
 
     subgraph Decode["1. decode_audio (static FFmpeg)"]
         direction TB
-        Open["Open container<br/>M4A, MP3, WAV, OPUS, MP4, ..."] --> Pick["Pick best audio stream"]
+        Open["Open container<br/>M4A, MP3, OPUS, MP4, ..."] --> Pick["Pick best audio stream"]
         Pick --> Dec["Decode packets to frames"]
         Dec --> Resample["Resample to 16 kHz mono f32"]
         Resample --> PCM[("pcm_16k: Vec&lt;f32&gt;")]
     end
 
-    Decode --> Locate["2. resolve_model_dir<br/>env override, ./models/basic, exe dir,<br/>~/.local/share/transcriber, manifest dir"]
-    Locate --> Load["3. Load ONNX Runtime + ParakeetTDT<br/>encoder-model.int8.onnx<br/>decoder_joint-model.int8.onnx<br/>vocab.txt"]
-    Load --> Route{"samples <= MAX_SAMPLES<br/>6,400,000 (400 s)?"}
+    Decode --> Load["2. Load CoreML models<br/>Preprocessor, Encoder_v2,<br/>Decoder, JointDecision, vocab"]
+    Load --> Windows
 
-    Route -- yes --> Single["Single pass<br/>transcribe_samples"]
-    Route -- no --> Chunking
-
-    subgraph Chunking["4. transcribe_pcm: chunked path"]
+    subgraph Windows["3. Windows (15 s, 4 s overlap)"]
         direction TB
-        Spans["chunk_spans<br/>5 min windows, 15 s overlap"] --> Loop["For each chunk:<br/>transcribe_chunk with word timestamps"]
-        Loop --> Fold["fold_trailing_punctuation<br/>attach . , ! ? to previous word"]
-        Fold --> Keep["absolute_keep_window<br/>keep words whose midpoint is<br/>inside this chunk's half of the overlap"]
-        Keep --> Loop
-        Keep --> Join["join_words<br/>stitch kept words into one transcript"]
+        Spans["chunk_spans"] --> Win["Next window"]
+        Win --> CM["CoreML decode<br/>mel, encoder, TDT loop"]
+        CM --> Gap{"Speech-level audio<br/>with no words for 1.5 s?"}
+        Gap -- no --> Own
+        Gap -- yes --> Retry["Retry: length policies,<br/>then cuts shifted +/- 1, 2, 3 s"]
+        Retry --> Gap2{"Gap closed?"}
+        Gap2 -- yes --> Own
+        Gap2 -- "no, keep the<br/>attempt with most words" --> Own
+        Own["own_words<br/>keep words whose midpoint is in this window's half of the overlap"]
+        Own --> Win
+        Own --> Join["join_words<br/>stitch into one transcript"]
     end
 
-    Single --> Text["Transcript text"]
-    Join --> Text
+    Join --> Text["Transcript text"]
     Text --> Out{"Quiet mode?"}
     Out -- yes --> Plain["stdout: text only"]
-    Out -- no --> Report["stdout: header, speed (x real-time), words, text"]
+    Out -- no --> Report["stdout: header, speed, words,<br/>recovery report, text"]
     Plain --> Save{"-o given?"}
     Report --> Save
     Save -- yes --> File["Write transcript file"]
@@ -59,75 +73,78 @@ flowchart TD
     File --> Done
 ```
 
-#### Stages
+#### CoreML models
 
-| Stage | Function | What it does |
-| :--- | :--- | :--- |
-| 1. Decode | `decode_audio` | FFmpeg demuxes, decodes and resamples any supported container to 16 kHz mono `f32` PCM held in memory |
-| 2. Locate model | `resolve_model_dir` | Finds `models/basic` without touching `~/.cache` or the network |
-| 3. Load model | `ParakeetTDT::from_pretrained` | Builds ONNX Runtime sessions for the encoder and decoder/joint graphs |
-| 4. Transcribe | `transcribe_pcm` | One pass for short audio, overlapping chunks for long audio |
-| 5. Output | `main` | Prints text (and metrics unless `-q`), optionally writes `-o` file |
+Four bundles from [FluidInference/parakeet-tdt-0.6b-v3-coreml](https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml) live in `models/coreml/`:
 
-#### Chunking details
+| Model | Input | Output | Notes |
+| :--- | :--- | :--- | :--- |
+| `Preprocessor.mlmodelc` | audio `[1, 240000]`, length | mel `[1, 128, 1501]` | 15 s fixed window, zero padded |
+| `Encoder_v2.mlmodelc` | mel, mel length | encoder `[1, 1024, 188]` | int8 per-channel; the original palettized encoder mangles words near window edges (FluidAudio issue 760) |
+| `Decoder.mlmodelc` | last token, LSTM state `[2, 1, 640]` | decoder step, new state | prediction network |
+| `JointDecision.mlmodelc` | encoder step, decoder step | token, probability, duration | single-step argmax joint |
 
-The exported encoder uses a fixed relative-position table of 9999 entries, centered at 5000. Attention adds a slice of that table onto scores that are `2 * steps - 1` wide, so the add only broadcasts while `steps <= 5000`. At 16 kHz with a 160-sample hop and 8x subsampling, 6,400,000 samples is exactly 5000 steps; one hop more fails.
+The TDT loop walks the encoder frames. At each frame the joint predicts a token and a duration. A non-blank token is emitted and advances the decoder state; the duration says how many frames to skip.
+
+#### Windowing
 
 | Constant | Value | Purpose |
 | :--- | :--- | :--- |
-| `MAX_SAMPLES` | 6,400,000 (400 s) | Longest input sent in a single pass |
-| `CHUNK_SAMPLES` | 4,800,000 (5 min) | Window length, safely under the limit |
-| `OVERLAP_SAMPLES` | 240,000 (15 s) | Shared audio between neighboring windows |
+| `COREML_WINDOW_SAMPLES` | 240,000 (15 s) | Fixed encoder input |
+| `COREML_OVERLAP_SAMPLES` | 64,000 (4 s) | Audio shared by neighbouring windows |
+| `GAP_SECS` | 1.5 s | Speech-level audio with no words that counts as a gap |
+| `SHIFTS_SECS` | -1, 1, -2, 2, -3, 3 | Cut shifts tried when a window still has a gap |
 
-```mermaid
-flowchart LR
-    subgraph Timeline["Audio timeline"]
-        direction LR
-        C1["Chunk 1<br/>0:00 - 5:00"] --- C2["Chunk 2<br/>4:45 - 9:45"] --- C3["Chunk 3<br/>9:30 - ..."]
-    end
-    C1 -. "cut at overlap midpoint (4:52.5)" .-> C2
-    C2 -. "cut at overlap midpoint (9:37.5)" .-> C3
-```
+Each cut sits in the middle of the overlap. A word is kept by the window that contains its midpoint, so every word is emitted once and was heard with at least 2 seconds of context on both sides.
 
-Each cut sits in the middle of the overlap. A word is kept by the chunk that contains its midpoint, so every word is emitted exactly once and was always heard with at least 7.5 seconds of context on both sides. The first chunk keeps everything from the start and the last chunk keeps everything to the end.
+---
+
+## Performance
+
+Measured on an Apple Silicon Mac (10 cores, 32 GB RAM), release build, one run, on `audio/sociallifeincamstarrzapata_13_gonzalez_64kb.mp3` (19 min 42 s).
+
+| Result | Value |
+| :--- | :--- |
+| Wall time | 41 s |
+| Speed | 28.7x real time |
+| Peak memory | 1.2 GB |
+| Words | 2,940 |
+| Windows needing recovery | 35 of about 108, all recovered |
+| Windows still incomplete | 0 |
+
+For context, measured before the ONNX build was removed from this project:
+
+- The ONNX build with 5 minute chunks took 54 to 68 s, peaked at 5.1 GB and produced 2,626 words.
+- CoreML with no checks took 11.6 s but produced only 2,201 words, because blank windows went unnoticed.
+- CoreML with recovery (using ONNX for the hardest windows) was about 92% similar to the ONNX-only transcript. The differences were mostly small wording variants ("13" against "thirteen", "Zapata" against "Sapata"), and each side had a few sentences the other lacked. The ONNX 5 minute chunks themselves silently dropped about 300 words of real speech.
+
+The first run after a model change is slower, because CoreML specialises the models for the Neural Engine and caches the result. A 21 second note took about 15 s the first time and 0.4 s afterwards.
 
 ---
 
 ## Prerequisites
 
-Building from source requires:
-
-1. **Rust 1.80+** and **Cargo**:
+1. **macOS 13 or newer**, Apple Silicon recommended.
+2. **Rust 1.80+** and **Cargo**.
+3. **Xcode 15+ with the Swift toolchain**: the `coreml` crate compiles a small Swift bridge during `cargo build`. The binary links the system Swift runtime from `/usr/lib/swift`.
+4. **FFmpeg development libraries** (compile time only):
    ```bash
-   rustc --version
-   cargo --version
+   brew install ffmpeg
    ```
-
-2. **FFmpeg development libraries** (compile-time only):
-   - macOS:
-     ```bash
-     brew install ffmpeg
-     ```
-   - Linux (Debian/Ubuntu):
-     ```bash
-     sudo apt install -y libavcodec-dev libavformat-dev libavutil-dev libswresample-dev
-     ```
 
 ---
 
 ## Building and Installation
 
-### 1. Build release binary
+### 1. Build the release binary
 
-Cargo executes `scripts/build.rs` to verify or download model files to `models/`, then compiles the binary:
+Cargo runs `scripts/build.rs`, which verifies or downloads the CoreML model files (about 0.65 GB), then compiles:
 
 ```bash
 cargo build --release
 ```
 
-The compiled executable is located at `target/release/transcribe`.
-
-To check or download models without building the CLI binary:
+The executable is `target/release/transcribe`. To check or download models without building:
 
 ```bash
 cargo run --bin download-models
@@ -135,7 +152,7 @@ cargo run --bin download-models
 
 ### 2. Export system-wide
 
-Run `export.sh` to install the binary to `~/.local/bin` (or pass a custom installation directory):
+`export.sh` installs the binary to `~/.local/bin` (or a directory you pass):
 
 ```bash
 ./export.sh
@@ -143,7 +160,7 @@ Run `export.sh` to install the binary to `~/.local/bin` (or pass a custom instal
 
 ### 3. Run tests
 
-Unit tests live in `src/transcribe_tests.rs`:
+Unit tests live in `src/transcribe_tests.rs` (windowing and stitching) and `src/coreml_tests.rs` (CoreML word assembly and gap detection):
 
 ```bash
 cargo test --bin transcribe
@@ -162,10 +179,10 @@ transcribe audio.opus -o transcript.txt
 
 # Quiet mode (stdout contains only transcribed text)
 transcribe audio.m4a -q
-transcribe audio.wav -q | pbcopy
+transcribe audio.mp3 -q | pbcopy
 ```
 
-Long recordings (for example a 48 minute lecture) work without any flag; chunking is automatic.
+Long recordings work without any flag; windowing and recovery are automatic.
 
 ### Options
 
@@ -195,13 +212,17 @@ Options:
 ├── start.sh                 # Local launcher script
 ├── audio/                   # Sample audio files for testing
 ├── models/
-│   └── basic/               # Parakeet TDT 0.6B ONNX assets
-│       ├── vocab.txt
-│       ├── decoder_joint-model.int8.onnx
-│       └── encoder-model.int8.onnx
+│   └── coreml/              # Parakeet TDT 0.6B v3 CoreML bundles
+│       ├── Preprocessor.mlmodelc/
+│       ├── Encoder_v2.mlmodelc/
+│       ├── Decoder.mlmodelc/
+│       ├── JointDecision.mlmodelc/
+│       └── parakeet_v3_vocab.json
 ├── src/
-│   ├── transcribe.rs        # CLI, decoding, chunked transcription pipeline
-│   └── transcribe_tests.rs  # Unit tests for chunking and stitching
+│   ├── transcribe.rs        # CLI, decoding, windowing, recovery and stitching
+│   ├── coreml.rs            # CoreML engine: models, TDT decode loop, word assembly
+│   ├── transcribe_tests.rs  # Tests for windowing and stitching
+│   └── coreml_tests.rs      # Tests for CoreML word assembly and gap detection
 └── scripts/
     ├── build.rs             # Cargo build script for checking/downloading models
     └── download_models.rs   # Standalone runner for model downloading

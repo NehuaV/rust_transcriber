@@ -6,21 +6,26 @@ Welcome! When working in this repository as an AI agent or automated developer, 
 
 - **Scratch & Test Space**: You are encouraged to create temporary scripts, test harnesses, debugging utilities, and experimental code in the [`scripts/`](file:///Users/dobri/git/transcriber/scripts) folder (`/scripts`).
 - **Usage**:
-  - Use `/scripts` for scratch work such as validating audio decoding, prototyping new CLI options, running benchmarks, checking ONNX model tensors, or testing format edge cases.
+  - Use `/scripts` for scratch work such as validating audio decoding, prototyping new CLI options, running benchmarks, checking model tensors, or testing format edge cases.
   - Keep ad-hoc test scripts contained within the `/scripts` directory to maintain a clean root and project structure.
   - When scripts are no longer needed or testing is finalized, ensure the main codebase remains clean and self-contained.
-- **Unit Tests**: Keep unit tests in a separate file, [`src/transcribe_tests.rs`](file:///Users/dobri/git/transcriber/src/transcribe_tests.rs), included from `src/transcribe.rs` via `#[path]`. Do not inline `mod tests { ... }` bodies in `transcribe.rs`.
+- **Unit Tests**: Keep unit tests in separate files, never inline `mod tests { ... }` bodies:
+  - [`src/transcribe_tests.rs`](file:///Users/dobri/git/transcriber/src/transcribe_tests.rs): windowing and stitching.
+  - [`src/coreml_tests.rs`](file:///Users/dobri/git/transcriber/src/coreml_tests.rs): CoreML word assembly and gap detection.
+  - Both are included from `src/transcribe.rs` via `#[path]`.
+- **Which binary you test matters**: in the agent sandbox `CARGO_TARGET_DIR` points at a cache directory, so a binary in `./target/release/` can be stale. Run `"$CARGO_TARGET_DIR/release/transcribe"` after building, and check which file is newest.
 
 ## Project Architecture
 
-- **Rust Standalone Binary**: The repository compiles one standalone CLI binary:
-  - `./transcribe`: Source in [`src/transcribe.rs`](file:///Users/dobri/git/transcriber/src/transcribe.rs) using the NVIDIA Parakeet TDT 0.6B v3 model from `models/basic/`.
-  - The binary can be exported system-wide using [`./export.sh`](file:///Users/dobri/git/transcriber/export.sh) to `~/.local/bin`.
-  - The streaming model (Nemotron) and its `stranscribe` binary were removed. Chunked batch transcription gave better quality, so do not reintroduce a streaming path without a clear reason.
-- **Long Audio Chunking**: The Parakeet TDT encoder only supports about 5000 encoder steps (about 400 seconds) per call because of its fixed relative-position table. `transcribe` splits longer audio into 5-minute chunks with 15 seconds of overlap and stitches them on word midpoints. Keep `CHUNK_SAMPLES` below `MAX_SAMPLES` in `src/transcribe.rs` when changing chunk sizes.
-- **No Multithreading**: Parallel chunk workers (`-m N`, one `ParakeetTDT` per worker) were tried and removed. They gave at most about 1.2x speedup for roughly double the memory, because ONNX Runtime already uses all cores for one run. Do not reintroduce them without a clear memory budget.
+- **macOS only, CoreML only**: This project targets macOS (Apple Silicon) and runs the model on CoreML. Do not add `cfg(target_os)` gating, Linux or Windows support, or another inference backend. An ONNX backend (`parakeet-rs`) and a streaming Nemotron binary (`stranscribe`) existed and were removed on purpose.
+- **One binary**: `./transcribe`, source in [`src/transcribe.rs`](file:///Users/dobri/git/transcriber/src/transcribe.rs) and [`src/coreml.rs`](file:///Users/dobri/git/transcriber/src/coreml.rs), exported system-wide with [`./export.sh`](file:///Users/dobri/git/transcriber/export.sh) to `~/.local/bin`.
+- **Model**: NVIDIA Parakeet TDT 0.6B v3 CoreML bundles from `models/coreml/`, run through the safe `coreml` crate. The TDT decode loop is our own Rust code. Uses `Encoder_v2` (int8 per-channel); the original palettized `Encoder` mangles words near window edges.
+- **Windows can blank (a model property)**: Parakeet TDT v3 decodes some 15 second cuts of clear speech to nothing (FluidAudio issue 909). The encoder input is fixed at 15 s, so audio is windowed (15 s, 4 s overlap, stitched on word midpoints by `own_words`). Never use a window's output without the gap check (1.5 s of speech-level audio with no words). The recovery order in `decode_window` is: retry with perturbed `LengthPolicy` values (confidence gated), then re-decode with the cut shifted by -1, +1, -2, +2, -3, +3 seconds (actual length and every policy for each). Without checks a test file lost about 16% of its words.
+- **Do not alter model output**: the checks may only add text where the model produced none. Never edit, drop or reorder words the model emitted (apart from overlap stitching). Report windows that stay incomplete (`RecoveryStats`) instead of hiding them.
+- **No multithreading**: Parallel chunk workers were tried (on the earlier ONNX path) and removed: about 1.2x speedup for about double the memory. CoreML already schedules work across the Neural Engine, GPU and CPU.
 - **Model Storage & Loading**:
-  - Model weights live in the `models/basic/` folder.
-  - The build script in [`scripts/build.rs`](file:///Users/dobri/git/transcriber/scripts/build.rs) automatically checks and downloads missing models once during `cargo build` or via `cargo run --bin download-models`.
-  - The binary loads models directly from `models/` on disk without looking at `~/.cache` or making any network requests at runtime.
+  - Weights live in `models/coreml/`.
+  - [`scripts/build.rs`](file:///Users/dobri/git/transcriber/scripts/build.rs) checks (size and hash) and downloads missing models during `cargo build` or via `cargo run --bin download-models`. It also links libc++ (the static FFmpeg has C++ code) and adds the `/usr/lib/swift` rpath that the `coreml` crate's Swift bridge needs.
+  - The binary loads models from `models/` on disk without looking at `~/.cache` or making network requests at runtime.
+- **Toolchain**: building requires Xcode with the Swift toolchain, because the `coreml` crate compiles a Swift bridge.
 - **Static FFmpeg Linking**: The binary statically links FFmpeg via `ffmpeg-sys-next`. Do not add runtime dependencies on external system CLI binaries.

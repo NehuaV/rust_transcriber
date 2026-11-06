@@ -2,12 +2,13 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use ffmpeg_next as ffmpeg;
 use indicatif::{ProgressBar, ProgressStyle};
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimedToken, TimestampMode, Transcriber};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-// Model directory resolution for local models/basic.
+mod coreml;
+
+use coreml::TimedToken;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,28 +32,25 @@ struct Cli {
     quiet: bool,
 }
 
-/// Resolves the model directory for Parakeet TDT from `models/basic`.
+/// Finds a model directory `models/<sub>` that contains `marker`.
 /// Uses local disk weights without looking at .cache or making network requests.
-fn resolve_model_dir() -> Result<PathBuf> {
+fn find_model_dir(sub: &str, marker: &str, env_var: &str) -> Option<PathBuf> {
+    let has_marker = |p: &Path| p.join(marker).exists();
+    let rel = format!("models/{sub}");
+
     // 1. Check environment variable override
-    if let Ok(dir_str) =
-        std::env::var("PARAKEET_MODEL_DIR").or_else(|_| std::env::var("MODELS_DIR"))
-    {
+    if let Ok(dir_str) = std::env::var(env_var).or_else(|_| std::env::var("MODELS_DIR")) {
         let p = PathBuf::from(dir_str);
-        let candidate = if p.join("vocab.txt").exists() {
-            p
-        } else {
-            p.join("basic")
-        };
-        if candidate.join("vocab.txt").exists() {
-            return Ok(candidate);
+        let candidate = if has_marker(&p) { p } else { p.join(sub) };
+        if has_marker(&candidate) {
+            return Some(candidate);
         }
     }
 
     // 2. Check relative to current working directory
-    let cwd_candidate = PathBuf::from("models/basic");
-    if cwd_candidate.join("vocab.txt").exists() {
-        return Ok(cwd_candidate);
+    let cwd_candidate = PathBuf::from(&rel);
+    if has_marker(&cwd_candidate) {
+        return Some(cwd_candidate);
     }
 
     // 3. Check relative to executable location (resolving symlinks)
@@ -60,36 +58,43 @@ fn resolve_model_dir() -> Result<PathBuf> {
         let real_exe = fs::canonicalize(&exe_path).unwrap_or(exe_path);
         if let Some(exe_dir) = real_exe.parent() {
             let candidates = [
-                exe_dir.join("models/basic"),
-                exe_dir.join("../models/basic"),
-                exe_dir.join("../share/transcriber/models/basic"),
+                exe_dir.join(&rel),
+                exe_dir.join("..").join(&rel),
+                exe_dir.join("../share/transcriber").join(&rel),
             ];
-            for candidate in &candidates {
-                if candidate.join("vocab.txt").exists() {
-                    return Ok(candidate.clone());
+            for candidate in candidates {
+                if has_marker(&candidate) {
+                    return Some(candidate);
                 }
             }
         }
     }
 
-    // 4. Check user local share directory (~/.local/share/transcriber/models/basic)
+    // 4. Check user local share directory (~/.local/share/transcriber/models/<sub>)
     if let Ok(home) = std::env::var("HOME") {
-        let share_dir = PathBuf::from(home).join(".local/share/transcriber/models/basic");
-        if share_dir.join("vocab.txt").exists() {
-            return Ok(share_dir);
+        let share_dir = PathBuf::from(home)
+            .join(".local/share/transcriber")
+            .join(&rel);
+        if has_marker(&share_dir) {
+            return Some(share_dir);
         }
     }
 
     // 5. Compile-time directory fallback
-    let manifest_rel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/basic");
-    if manifest_rel.join("vocab.txt").exists() {
-        return Ok(manifest_rel);
+    let manifest_rel = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&rel);
+    if has_marker(&manifest_rel) {
+        return Some(manifest_rel);
     }
 
-    bail!(
-        "Parakeet TDT model not found in 'models/basic'.\n\
+    None
+}
+
+/// Resolves the CoreML model directory from `models/coreml`.
+fn resolve_coreml_dir() -> Result<PathBuf> {
+    find_model_dir("coreml", "parakeet_v3_vocab.json", "PARAKEET_COREML_DIR").context(
+        "Parakeet CoreML models not found in 'models/coreml'.\n\
          Please run scripts/build.rs or execute:\n\
-         cargo run --bin download-models"
+         cargo run --bin download-models",
     )
 }
 
@@ -235,33 +240,6 @@ fn format_bytes(bytes: u64) -> String {
 
 /// 16 kHz mono, matching the Parakeet TDT preprocessor.
 const SAMPLE_RATE: u32 = 16_000;
-/// Mel hop used by the TDT preprocessor. Mel frames are `samples / HOP_LENGTH`.
-const HOP_LENGTH: usize = 160;
-/// Encoder steps the exported relative-position table can attend over.
-///
-/// The table is `[1, 9999, 1024]`, sliced around a center of 5000. Attention
-/// then adds that slice (`2 * steps - 1` wide) onto scores of the same width.
-/// Past 5000 steps the slice stays 9999 wide and the add cannot broadcast.
-const MAX_ENCODER_STEPS: i64 = 5_000;
-/// 6_400_000 samples is exactly 5000 encoder steps. The next hop is 5001.
-const MAX_SAMPLES: usize = 6_400_000;
-/// Five minutes. Stays under the positional-embedding limit and matches the
-/// chunk length recommended for this model.
-const CHUNK_SAMPLES: usize = 5 * 60 * SAMPLE_RATE as usize;
-/// Shared audio on each side of a cut so a word on the boundary is fully
-/// inside the chunk that owns it.
-const OVERLAP_SAMPLES: usize = 15 * SAMPLE_RATE as usize;
-
-/// Encoder length for `samples` of 16 kHz audio: `1 + (mel_frames - 1) / 8`.
-fn encoder_steps(samples: usize) -> i64 {
-    let mel_frames = (samples / HOP_LENGTH) as i64;
-    if mel_frames <= 0 {
-        0
-    } else {
-        1 + (mel_frames - 1) / 8
-    }
-}
-
 /// Half-open sample ranges of at most `chunk_len`, each overlapping the next
 /// by `overlap` samples. The last range always runs through `total`.
 fn chunk_spans(total: usize, chunk_len: usize, overlap: usize) -> Vec<(usize, usize)> {
@@ -293,9 +271,15 @@ fn chunk_spans(total: usize, chunk_len: usize, overlap: usize) -> Vec<(usize, us
 /// past that cut, so a word assigned by its midpoint was heard in full.
 /// The last chunk keeps every remaining word, including timestamps that land
 /// slightly past the final sample.
-fn absolute_keep_window(start: usize, end: usize, is_first: bool, is_last: bool) -> (f32, f32) {
+fn absolute_keep_window(
+    start: usize,
+    end: usize,
+    overlap: usize,
+    is_first: bool,
+    is_last: bool,
+) -> (f32, f32) {
     let rate = SAMPLE_RATE as f32;
-    let half_overlap = (OVERLAP_SAMPLES / 2) as f32 / rate;
+    let half_overlap = (overlap / 2) as f32 / rate;
     let from = if is_first {
         0.0
     } else {
@@ -332,7 +316,7 @@ fn fold_trailing_punctuation(words: Vec<TimedToken>) -> Vec<TimedToken> {
     out
 }
 
-/// Join word tokens the same way `parakeet-rs` rebuilds `TimestampMode::Words`.
+/// Join words with single spaces, attaching trailing punctuation to the previous word.
 fn join_words(words: &[TimedToken]) -> String {
     let mut out = String::new();
     for (i, word) in words.iter().enumerate() {
@@ -345,84 +329,271 @@ fn join_words(words: &[TimedToken]) -> String {
     out
 }
 
-/// Transcribe one window and return only the words this chunk owns, with
-/// timestamps shifted to the whole recording.
-fn transcribe_chunk(
-    model: &mut ParakeetTDT,
-    pcm: &[f32],
-    index: usize,
-    total: usize,
+/// Keep only the words this chunk owns and shift their timestamps to the whole
+/// recording. Trailing punctuation is folded onto the word it closes first.
+fn own_words(
+    tokens: Vec<TimedToken>,
+    offset_samples: usize,
     start: usize,
     end: usize,
-) -> Result<Vec<TimedToken>> {
-    let steps = encoder_steps(end - start);
-    if steps > MAX_ENCODER_STEPS {
-        bail!(
-            "Internal error: chunk of {} samples is {} encoder steps, above the {} step limit",
-            end - start,
-            steps,
-            MAX_ENCODER_STEPS
-        );
-    }
-    let result = model
-        .transcribe_samples(
-            pcm[start..end].to_vec(),
-            SAMPLE_RATE,
-            1,
-            Some(TimestampMode::Words),
-        )
-        .with_context(|| {
-            format!(
-                "Transcription failed during inference (chunk {}/{}, samples {}..{})",
-                index + 1,
-                total,
-                start,
-                end
-            )
-        })?;
-
-    let (keep_from, keep_to) = absolute_keep_window(start, end, index == 0, index + 1 == total);
-    let offset = start as f32 / SAMPLE_RATE as f32;
+    overlap: usize,
+    index: usize,
+    total: usize,
+) -> Vec<TimedToken> {
+    let (keep_from, keep_to) =
+        absolute_keep_window(start, end, overlap, index == 0, index + 1 == total);
+    let offset = offset_samples as f32 / SAMPLE_RATE as f32;
     let mut kept = Vec::new();
-    for word in fold_trailing_punctuation(result.tokens) {
+    for mut word in fold_trailing_punctuation(tokens) {
         let mid = offset + (word.start + word.end) * 0.5;
         if mid >= keep_from && mid < keep_to && !word.text.trim().is_empty() {
+            word.start += offset;
+            word.end += offset;
             kept.push(word);
         }
     }
-    Ok(kept)
+    kept
 }
 
-/// Transcribe 16 kHz mono PCM. Files that fit in the positional embedding run
-/// in one pass. Longer files are cut into overlapping windows, transcribed one
-/// at a time, and stitched on word midpoints so a word on a boundary is
-/// emitted once.
-fn transcribe_pcm(
-    model: &mut ParakeetTDT,
-    pcm: &[f32],
-    spinner: Option<&ProgressBar>,
-) -> Result<String> {
-    if pcm.len() <= MAX_SAMPLES {
-        if let Some(sp) = spinner {
-            sp.set_message("Transcribing...");
-        }
-        let result = model
-            .transcribe_samples(pcm.to_vec(), SAMPLE_RATE, 1, None)
-            .context("Transcription failed during inference")?;
-        return Ok(result.text);
+/// CoreML window length: the fixed-shape encoder takes exactly 15 seconds.
+const COREML_WINDOW_SAMPLES: usize = coreml::WINDOW_SAMPLES;
+/// Audio shared by neighbouring CoreML windows. Each cut sits in the middle of
+/// the overlap, so every kept word had `overlap / 2` of context on both sides.
+const COREML_OVERLAP_SAMPLES: usize = 4 * SAMPLE_RATE as usize;
+
+/// Seconds per bin when looking for speech the model skipped.
+const GAP_BIN_SECS: f32 = 0.5;
+/// A stretch this long with speech-level energy and no words is suspicious.
+const GAP_SECS: f32 = 1.5;
+/// RMS above which a bin counts as speech-level (about -50 dBFS).
+const SPEECH_RMS: f32 = 0.003;
+/// Windows shorter than this are too small to call a blank suspicious.
+const MIN_RECOVERY_SECS: f32 = 2.0;
+
+/// True when `window[keep_from..keep_to]` (seconds, relative to the window)
+/// holds a run of at least `GAP_SECS` of speech-level audio in which no word
+/// starts. `word_times` are word midpoints in the same time base.
+///
+/// The fixed-window CoreML export sometimes decodes a stretch of clear speech
+/// to nothing; that is the signature this looks for.
+fn has_speech_gap(window: &[f32], keep_from: f32, keep_to: f32, word_times: &[f32]) -> bool {
+    let rate = SAMPLE_RATE as f32;
+    let window_secs = window.len() as f32 / rate;
+    let from = keep_from.max(0.0);
+    let to = keep_to.min(window_secs);
+    if to - from < GAP_SECS {
+        return false;
     }
 
-    let spans = chunk_spans(pcm.len(), CHUNK_SAMPLES, OVERLAP_SAMPLES);
+    let mut run = 0.0f32;
+    let mut bin_start = from;
+    while bin_start < to {
+        let bin_end = (bin_start + GAP_BIN_SECS).min(to);
+        let lo = (bin_start * rate) as usize;
+        let hi = ((bin_end * rate) as usize).min(window.len());
+        let rms = if hi > lo {
+            (window[lo..hi].iter().map(|v| v * v).sum::<f32>() / (hi - lo) as f32).sqrt()
+        } else {
+            0.0
+        };
+        let has_word = word_times.iter().any(|&t| t >= bin_start && t < bin_end);
+        if rms >= SPEECH_RMS && !has_word {
+            run += bin_end - bin_start;
+            if run >= GAP_SECS {
+                return true;
+            }
+        } else {
+            run = 0.0;
+        }
+        bin_start = bin_end;
+    }
+    false
+}
+
+/// Words one CoreML window owns, plus whether a suspicious gap remains.
+struct WindowWords {
+    words: Vec<TimedToken>,
+    gap: bool,
+}
+
+/// Keep the words a window owns and check them against the audio for gaps.
+fn own_window_words(
+    decode_words: Vec<TimedToken>,
+    window: &[f32],
+    offset_samples: usize,
+    start: usize,
+    end: usize,
+    index: usize,
+    total: usize,
+) -> WindowWords {
+    let words = own_words(
+        decode_words,
+        offset_samples,
+        start,
+        end,
+        COREML_OVERLAP_SAMPLES,
+        index,
+        total,
+    );
+
+    let rate = SAMPLE_RATE as f32;
+    let offset = start as f32 / rate;
+    let (keep_from, keep_to) = absolute_keep_window(
+        start,
+        end,
+        COREML_OVERLAP_SAMPLES,
+        index == 0,
+        index + 1 == total,
+    );
+    let mids: Vec<f32> = words
+        .iter()
+        .map(|w| (w.start + w.end) * 0.5 - offset)
+        .collect();
+    let gap = window.len() as f32 / rate >= MIN_RECOVERY_SECS
+        && has_speech_gap(window, keep_from - offset, keep_to - offset, &mids);
+    WindowWords { words, gap }
+}
+
+/// Retry cuts: seconds to shift the window start when a window still has a gap.
+/// A different cut flips an input on which the model would stay blank.
+const SHIFTS_SECS: [i64; 6] = [-1, 1, -2, 2, -3, 3];
+/// A retry must reach this mean token confidence to be trusted.
+const MIN_RECOVERY_CONFIDENCE: f32 = 0.7;
+/// A retry must emit at least this many tokens to be trusted.
+const MIN_RECOVERY_TOKENS: usize = 2;
+
+/// How many windows needed help.
+#[derive(Default)]
+struct RecoveryStats {
+    /// Windows that needed a retry and ended without a gap.
+    recovered: usize,
+    /// Windows that still have a gap after every retry.
+    unresolved: usize,
+}
+
+/// Decode `pcm[span_start..span_end]` and keep the words the nominal window
+/// `start..end` owns. Perturbed policies are only trusted when confident.
+#[allow(clippy::too_many_arguments)]
+fn try_decode(
+    engine: &coreml::CoreMlEngine,
+    pcm: &[f32],
+    span_start: usize,
+    span_end: usize,
+    policy: coreml::LengthPolicy,
+    start: usize,
+    end: usize,
+    index: usize,
+    total: usize,
+) -> Option<WindowWords> {
+    let decode = engine
+        .transcribe_window(&pcm[span_start..span_end], policy)
+        .ok()?;
+    if policy != coreml::LengthPolicy::ACTUAL
+        && (decode.token_count < MIN_RECOVERY_TOKENS
+            || decode.mean_confidence < MIN_RECOVERY_CONFIDENCE)
+    {
+        return None;
+    }
+    Some(own_window_words(
+        decode.words,
+        &pcm[start..end],
+        span_start,
+        start,
+        end,
+        index,
+        total,
+    ))
+}
+
+/// Decode one window. If the result leaves a stretch of speech-level audio
+/// without words, retry with perturbed length declarations, then with the cut
+/// shifted by a few seconds. Returns the first result without a gap, otherwise
+/// the attempt with the most words.
+fn decode_window(
+    engine: &coreml::CoreMlEngine,
+    pcm: &[f32],
+    start: usize,
+    end: usize,
+    index: usize,
+    total: usize,
+    stats: &mut RecoveryStats,
+) -> Result<Vec<TimedToken>> {
+    let first = try_decode(
+        engine,
+        pcm,
+        start,
+        end,
+        coreml::LengthPolicy::ACTUAL,
+        start,
+        end,
+        index,
+        total,
+    )
+    .with_context(|| format!("CoreML inference failed (window {}/{})", index + 1, total))?;
+    if !first.gap {
+        return Ok(first.words);
+    }
+
+    let mut best = first;
+    let rate = SAMPLE_RATE as i64;
+    let mut spans = vec![(start, end)];
+    for shift in SHIFTS_SECS {
+        let shifted = (start as i64 + shift * rate).clamp(0, pcm.len() as i64) as usize;
+        let span_end = (shifted + COREML_WINDOW_SAMPLES).min(pcm.len());
+        if span_end.saturating_sub(shifted) >= (MIN_RECOVERY_SECS * rate as f32) as usize {
+            spans.push((shifted, span_end));
+        }
+    }
+    for (span_index, &(span_start, span_end)) in spans.iter().enumerate() {
+        let policies: Vec<coreml::LengthPolicy> = if span_index == 0 {
+            coreml::LengthPolicy::RECOVERY.to_vec()
+        } else {
+            std::iter::once(coreml::LengthPolicy::ACTUAL)
+                .chain(coreml::LengthPolicy::RECOVERY)
+                .collect()
+        };
+        for policy in policies {
+            let Some(candidate) = try_decode(
+                engine, pcm, span_start, span_end, policy, start, end, index, total,
+            ) else {
+                continue;
+            };
+            if !candidate.gap {
+                stats.recovered += 1;
+                return Ok(candidate.words);
+            }
+            if candidate.words.len() > best.words.len() {
+                best = candidate;
+            }
+        }
+    }
+    stats.unresolved += 1;
+    Ok(best.words)
+}
+
+/// Transcribe 16 kHz mono PCM with CoreML. The encoder only takes 15 second
+/// windows, so every file is windowed and stitched on word midpoints.
+fn transcribe_audio(pcm: &[f32], spinner: Option<&ProgressBar>) -> Result<(String, RecoveryStats)> {
+    if let Some(sp) = spinner {
+        sp.set_message("Loading Parakeet TDT CoreML models...");
+    }
+    let dir = resolve_coreml_dir()
+        .context("Failed to locate Parakeet CoreML models in 'models/coreml'")?;
+    let engine = coreml::CoreMlEngine::load(&dir)?;
+
+    let spans = chunk_spans(pcm.len(), COREML_WINDOW_SAMPLES, COREML_OVERLAP_SAMPLES);
     let total = spans.len();
+    let mut stats = RecoveryStats::default();
     let mut kept = Vec::new();
     for (i, &(start, end)) in spans.iter().enumerate() {
         if let Some(sp) = spinner {
-            sp.set_message(format!("Transcribing chunk {}/{}...", i + 1, total));
+            sp.set_message(format!("Transcribing window {}/{}...", i + 1, total));
         }
-        kept.extend(transcribe_chunk(model, pcm, i, total, start, end)?);
+        kept.extend(decode_window(
+            &engine, pcm, start, end, i, total, &mut stats,
+        )?);
     }
-
-    Ok(join_words(&kept))
+    Ok((join_words(&kept), stats))
 }
 
 fn main() -> Result<()> {
@@ -459,26 +630,10 @@ fn main() -> Result<()> {
     let audio = decode_audio(&cli.input)
         .context("Failed to decode audio. Please ensure the file contains a valid audio stream.")?;
 
-    if let Some(ref sp) = spinner {
-        sp.set_message("Loading Parakeet TDT model...");
-    }
-
-    // Step 2: Locate local model in models/basic
-    let model_dir =
-        resolve_model_dir().context("Failed to locate Parakeet TDT model in 'models/basic'")?;
-
-    // Step 3: Run inference via parakeet-rs
+    // Step 2: Load the CoreML models and transcribe
     let t0 = Instant::now();
-    let env = parakeet_rs::ort::init()
-        .build()
-        .context("Failed to initialize ONNX Runtime environment")?;
-    let config = ExecutionConfig::new().with_environment(env);
-    let mut model = ParakeetTDT::from_pretrained(&model_dir, Some(config))
-        .context("Failed to load ParakeetTDT model from 'models/basic'")?;
-
-    let text = transcribe_pcm(&mut model, &audio.pcm_16k, spinner.as_ref())?
-        .trim()
-        .to_string();
+    let (text, stats) = transcribe_audio(&audio.pcm_16k, spinner.as_ref())?;
+    let text = text.trim().to_string();
 
     let elapsed = t0.elapsed().as_secs_f64();
 
@@ -511,6 +666,12 @@ fn main() -> Result<()> {
             "Speed: {:.1}x real-time ({:.2}s elapsed, {} words)",
             rtfx, elapsed, word_count
         );
+        if stats.recovered + stats.unresolved > 0 {
+            println!(
+                "Recovery: {} window(s) retried successfully, {} still incomplete",
+                stats.recovered, stats.unresolved
+            );
+        }
         println!();
         if text.is_empty() {
             println!("(No speech detected)");
@@ -535,3 +696,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 #[path = "transcribe_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "coreml_tests.rs"]
+mod coreml_tests;

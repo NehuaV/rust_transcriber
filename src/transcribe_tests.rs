@@ -1,44 +1,31 @@
 use super::*;
 
 #[test]
-fn encoder_limit_matches_positional_embedding() {
-    assert_eq!(encoder_steps(MAX_SAMPLES), MAX_ENCODER_STEPS);
-    assert_eq!(
-        encoder_steps(MAX_SAMPLES + HOP_LENGTH),
-        MAX_ENCODER_STEPS + 1
-    );
-    assert!(encoder_steps(CHUNK_SAMPLES) < MAX_ENCODER_STEPS);
-    assert!(CHUNK_SAMPLES < MAX_SAMPLES);
-    assert!(OVERLAP_SAMPLES < CHUNK_SAMPLES);
-    assert_eq!(OVERLAP_SAMPLES % 2, 0);
-}
-
-#[test]
-fn long_audio_chunks_stay_inside_encoder_limit() {
-    // 2 * 18062 - 1 = 36123, the attention axis from the reported failure.
-    let steps = 18_062usize;
-    let mel_frames = (steps - 1) * 8 + 1;
-    let samples = mel_frames * HOP_LENGTH;
-    assert_eq!(encoder_steps(samples), steps as i64);
-
-    let spans = chunk_spans(samples, CHUNK_SAMPLES, OVERLAP_SAMPLES);
+fn coreml_windows_cover_the_audio_with_overlap() {
+    // 2 minutes 7 seconds of audio.
+    let samples = 127 * SAMPLE_RATE as usize;
+    let spans = chunk_spans(samples, COREML_WINDOW_SAMPLES, COREML_OVERLAP_SAMPLES);
     assert!(spans.len() > 1);
-    assert_eq!(spans.first().copied(), Some((0, CHUNK_SAMPLES)));
+    assert_eq!(spans.first().copied(), Some((0, COREML_WINDOW_SAMPLES)));
     assert_eq!(spans.last().map(|span| span.1), Some(samples));
 
     let mut covered_until = 0.0f32;
     for (i, &(start, end)) in spans.iter().enumerate() {
         assert!(start < end);
-        assert!(encoder_steps(end - start) <= MAX_ENCODER_STEPS);
+        assert!(end - start <= COREML_WINDOW_SAMPLES);
         let is_last = i + 1 == spans.len();
         if is_last {
-            assert!(end - start > OVERLAP_SAMPLES);
+            assert!(end - start > COREML_OVERLAP_SAMPLES);
         } else {
-            assert_eq!(end - start, CHUNK_SAMPLES);
-            assert_eq!(spans[i + 1].0, start + CHUNK_SAMPLES - OVERLAP_SAMPLES);
+            assert_eq!(end - start, COREML_WINDOW_SAMPLES);
+            assert_eq!(
+                spans[i + 1].0,
+                start + COREML_WINDOW_SAMPLES - COREML_OVERLAP_SAMPLES
+            );
         }
 
-        let (from, to) = absolute_keep_window(start, end, i == 0, is_last);
+        // The windows' keep ranges tile the recording with no gaps or overlaps.
+        let (from, to) = absolute_keep_window(start, end, COREML_OVERLAP_SAMPLES, i == 0, is_last);
         if i == 0 {
             assert_eq!(from, 0.0);
         } else {
@@ -58,9 +45,66 @@ fn long_audio_chunks_stay_inside_encoder_limit() {
 }
 
 #[test]
-fn short_audio_is_one_chunk() {
-    let spans = chunk_spans(SAMPLE_RATE as usize, CHUNK_SAMPLES, OVERLAP_SAMPLES);
+fn short_audio_is_one_window() {
+    let spans = chunk_spans(
+        SAMPLE_RATE as usize,
+        COREML_WINDOW_SAMPLES,
+        COREML_OVERLAP_SAMPLES,
+    );
     assert_eq!(spans, vec![(0, SAMPLE_RATE as usize)]);
+    // A single window keeps everything.
+    assert_eq!(
+        absolute_keep_window(0, SAMPLE_RATE as usize, COREML_OVERLAP_SAMPLES, true, true),
+        (0.0, f32::MAX)
+    );
+}
+
+#[test]
+fn empty_audio_has_no_windows() {
+    assert!(chunk_spans(0, COREML_WINDOW_SAMPLES, COREML_OVERLAP_SAMPLES).is_empty());
+}
+
+#[test]
+fn words_are_owned_by_exactly_one_window() {
+    // Two windows over 20 s: the cut is at 4 s overlap middle = 13 s.
+    let samples = 20 * SAMPLE_RATE as usize;
+    let spans = chunk_spans(samples, COREML_WINDOW_SAMPLES, COREML_OVERLAP_SAMPLES);
+    assert_eq!(spans.len(), 2);
+
+    // A word at 12 s absolute is heard by both windows.
+    let first = own_words(
+        vec![token("hello", 11.9, 12.1)],
+        spans[0].0,
+        spans[0].0,
+        spans[0].1,
+        COREML_OVERLAP_SAMPLES,
+        0,
+        2,
+    );
+    let second = own_words(
+        vec![token("hello", 11.9 - 11.0, 12.1 - 11.0)],
+        spans[1].0,
+        spans[1].0,
+        spans[1].1,
+        COREML_OVERLAP_SAMPLES,
+        1,
+        2,
+    );
+    assert_eq!(first.len() + second.len(), 1);
+    assert_eq!(first.len(), 1, "12 s is before the 13 s cut");
+
+    // Kept words carry whole-recording timestamps.
+    let late = own_words(
+        vec![token("late", 5.0, 5.4)],
+        spans[1].0,
+        spans[1].0,
+        spans[1].1,
+        COREML_OVERLAP_SAMPLES,
+        1,
+        2,
+    );
+    assert_eq!(late.len(), 1);
+    assert!((late[0].start - 16.0).abs() < 1e-3);
 }
 
 #[test]
